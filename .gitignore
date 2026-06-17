@@ -1,0 +1,15 @@
+# CMake Build Outputs
+/build/
+
+# macOS System Files
+.DS_Store
+
+# IDE and Project Files
+/.vscode/
+/.idea/
+*.suo
+*.user
+*.userosscache
+*.sln
+*.vcxproj
+*.filters
