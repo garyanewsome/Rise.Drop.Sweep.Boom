@@ -3,113 +3,94 @@
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_dsp/juce_dsp.h>
 #include <cmath>
-#include <cstdlib>
+#include "FastRandom.h"
 
+/**
+ * Stereo white/pink noise through a sweeping band-pass or high-pass.
+ * Allocation-free; the cutoff follows the sweep in short chunks, so it is
+ * smooth regardless of the host buffer size.
+ */
 class NoiseEngine {
 public:
-    NoiseEngine() {
-        // Seed random number generator
-        std::srand(static_cast<unsigned int>(std::time(nullptr)));
-    }
-
     void prepare(const juce::dsp::ProcessSpec& spec) {
         currentSampleRate = spec.sampleRate;
-        filter.prepare(spec);
+        juce::dsp::ProcessSpec stereo = spec;
+        stereo.numChannels = 2;
+        filter.prepare(stereo);
+        randomL.setSeed(0xC0FFEE01u);
+        randomR.setSeed(0xBADC0DE5u);
         reset();
     }
 
     void reset() {
         filter.reset();
-        pinkNoiseL.reset();
-        pinkNoiseR.reset();
+        pinkL.reset();
+        pinkR.reset();
     }
 
-    void processBlock(juce::AudioBuffer<float>& buffer,
-                      float activePhase,
-                      float warpK,
-                      float volume,
-                      int noiseType, // 0 = White, 1 = Pink
-                      int filterMode, // 0 = Bandpass, 1 = Highpass
-                      float cutoffStart,
-                      float cutoffEnd,
-                      float resonance)
+    void processBlock(juce::AudioBuffer<float>& buffer, int startSample, int numSamples,
+                      double activePhaseStart, double activePhaseInc, float warpK, float volume,
+                      int noiseType,   // 0 = White, 1 = Pink
+                      int filterMode,  // 0 = Bandpass, 1 = Highpass
+                      float cutoffStart, float cutoffEnd, float resonance)
     {
-        if (currentSampleRate <= 0.0) return;
+        if (currentSampleRate <= 0.0 || numSamples <= 0 || buffer.getNumChannels() < 2)
+            return;
 
-        int numSamples = buffer.getNumSamples();
-        int numChannels = buffer.getNumChannels();
-        if (numChannels < 2) return;
-
-        // 1. Generate stereo-uncorrelated noise into a temporary buffer
-        juce::AudioBuffer<float> noiseBuffer(numChannels, numSamples);
-        float* leftNoise = noiseBuffer.getWritePointer(0);
-        float* rightNoise = noiseBuffer.getWritePointer(1);
-
-        if (noiseType == 1) { // Pink Noise
-            for (int sample = 0; sample < numSamples; ++sample) {
-                leftNoise[sample] = pinkNoiseL.nextSample() * volume;
-                rightNoise[sample] = pinkNoiseR.nextSample() * volume;
-            }
-        } else { // White Noise
-            for (int sample = 0; sample < numSamples; ++sample) {
-                leftNoise[sample] = (static_cast<float>(std::rand()) / RAND_MAX * 2.0f - 1.0f) * volume;
-                rightNoise[sample] = (static_cast<float>(std::rand()) / RAND_MAX * 2.0f - 1.0f) * volume;
-            }
-        }
-
-        // 2. Configure the State Variable Filter
-        if (filterMode == 1) {
-            filter.setType(juce::dsp::StateVariableTPTFilterType::highpass);
-        } else {
-            filter.setType(juce::dsp::StateVariableTPTFilterType::bandpass);
-        }
-
-        // Map active phase with warp curve to determine filter cutoff
-        float warpedPhase = std::pow(activePhase, warpK);
-        float cutoff = cutoffStart + (cutoffEnd - cutoffStart) * warpedPhase;
-
-        // Clamp cutoff to safe bounds
-        cutoff = juce::jlimit(20.0f, static_cast<float>(std::min(20000.0, currentSampleRate * 0.49)), cutoff);
-        filter.setCutoffFrequency(cutoff);
+        filter.setType(filterMode == 1 ? juce::dsp::StateVariableTPTFilterType::highpass
+                                       : juce::dsp::StateVariableTPTFilterType::bandpass);
         filter.setResonance(juce::jlimit(0.1f, 10.0f, resonance));
 
-        // 3. Filter the noise block in-place
-        juce::dsp::AudioBlock<float> block(noiseBuffer);
-        juce::dsp::ProcessContextReplacing<float> context(block);
-        filter.process(context);
+        float* left = buffer.getWritePointer(0) + startSample;
+        float* right = buffer.getWritePointer(1) + startSample;
+        const float maxCutoff = static_cast<float>(juce::jmin(20000.0, currentSampleRate * 0.49));
 
-        // 4. Add the filtered noise to the main output buffer
-        float* mainLeft = buffer.getWritePointer(0);
-        float* mainRight = buffer.getWritePointer(1);
-        for (int sample = 0; sample < numSamples; ++sample) {
-            mainLeft[sample] += leftNoise[sample];
-            mainRight[sample] += rightNoise[sample];
+        constexpr int chunk = 32;
+        for (int offset = 0; offset < numSamples; offset += chunk) {
+            const int n = juce::jmin(chunk, numSamples - offset);
+
+            // Cutoff at the middle of this chunk.
+            const double phase = juce::jlimit(0.0, 1.0, activePhaseStart + activePhaseInc * (offset + n * 0.5));
+            const float warped = static_cast<float>(std::pow(phase, static_cast<double>(warpK)));
+            const float cutoff = juce::jlimit(20.0f, maxCutoff, cutoffStart + (cutoffEnd - cutoffStart) * warped);
+            filter.setCutoffFrequency(cutoff);
+
+            for (int i = 0; i < n; ++i) {
+                float l, r;
+                if (noiseType == 1) {
+                    l = pinkL.next(randomL);
+                    r = pinkR.next(randomR);
+                } else {
+                    l = randomL.nextBipolar();
+                    r = randomR.nextBipolar();
+                }
+                left[offset + i] += filter.processSample(0, l * volume);
+                right[offset + i] += filter.processSample(1, r * volume);
+            }
         }
     }
 
 private:
-    struct PinkNoiseGenerator {
-        float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f, b3 = 0.0f, b4 = 0.0f, b5 = 0.0f, b6 = 0.0f;
+    struct PinkGenerator {
+        float b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+        void reset() { b0 = b1 = b2 = b3 = b4 = b5 = b6 = 0.0f; }
 
-        void reset() {
-            b0 = b1 = b2 = b3 = b4 = b5 = b6 = 0.0f;
-        }
-
-        inline float nextSample() {
-            float white = static_cast<float>(std::rand()) / RAND_MAX * 2.0f - 1.0f;
+        float next(FastRandom& rng) {
+            const float white = rng.nextBipolar();
             b0 = 0.99886f * b0 + white * 0.0555179f;
             b1 = 0.99332f * b1 + white * 0.0750759f;
             b2 = 0.96900f * b2 + white * 0.1538520f;
             b3 = 0.86650f * b3 + white * 0.3104856f;
             b4 = 0.55000f * b4 + white * 0.5329522f;
             b5 = -0.7616f * b5 - white * 0.0168980f;
-            float pink = b0 + b1 + b2 + b3 + b4 + b5 + b6 + white * 0.5362f;
+            const float pink = b0 + b1 + b2 + b3 + b4 + b5 + b6 + white * 0.5362f;
             b6 = white * 0.115926f;
-            return pink * 0.11f; // Scaled to ~1.0 RMS peak
+            return pink * 0.11f;
         }
     };
 
     double currentSampleRate = 44100.0;
-    PinkNoiseGenerator pinkNoiseL, pinkNoiseR;
+    PinkGenerator pinkL, pinkR;
+    FastRandom randomL, randomR;
     juce::dsp::StateVariableTPTFilter<float> filter;
 };

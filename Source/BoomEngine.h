@@ -4,12 +4,11 @@
 #include <juce_dsp/juce_dsp.h>
 #include <cmath>
 #include <cstdlib>
+#include "FastRandom.h"
 
 class BoomEngine {
 public:
-    BoomEngine() {
-        std::srand(static_cast<unsigned int>(std::time(nullptr)));
-    }
+    BoomEngine() = default;
 
     void prepare(const juce::dsp::ProcessSpec& spec) {
         currentSampleRate = spec.sampleRate;
@@ -51,14 +50,19 @@ public:
         subPhase = 0.0;
         shockwaveElapsedSamples = 0;
         subElapsedSamples = 0;
+        startDelay = 0;
     }
 
-    void trigger() {
+    // Fire the impact. delaySamples positions it inside the current block, so
+    // the drop lands on the exact sample the transition ends / begins.
+    void trigger(int delaySamples = 0) {
         isSubActive = true;
         isShockwaveActive = true;
         subPhase = 0.0;
         shockwaveElapsedSamples = 0;
         subElapsedSamples = 0;
+        startDelay = juce::jmax(0, delaySamples);
+        random.setSeed(0xB00B1E55u + static_cast<uint32_t>(triggerCount++));
     }
 
     void processBlock(juce::AudioBuffer<float>& buffer,
@@ -71,74 +75,68 @@ public:
         if (currentSampleRate <= 0.0) return;
         if (!isSubActive && !isShockwaveActive) return;
 
-        int numSamples = buffer.getNumSamples();
-        int numChannels = buffer.getNumChannels();
+        const int numSamples = buffer.getNumSamples();
+        const int numChannels = buffer.getNumChannels();
         if (numChannels < 2) return;
 
         float* leftChannel = buffer.getWritePointer(0);
         float* rightChannel = buffer.getWritePointer(1);
 
-        double ts = 1.0 / currentSampleRate;
+        const double ts = 1.0 / currentSampleRate;
+        const float endFloor = std::exp(-5.0f);
 
         for (int sample = 0; sample < numSamples; ++sample) {
+            // A delayed trigger stays silent until its sample position arrives.
+            if (startDelay > 0) {
+                --startDelay;
+                continue;
+            }
+
             float outL = 0.0f;
             float outR = 0.0f;
 
-            // 1. Process Noise Shockwave (LPF white noise with short linear decay)
+            // 1. Noise shockwave: low-passed noise burst with a short linear decay
             if (isShockwaveActive) {
-                double elapsedSec = shockwaveElapsedSamples * ts;
+                const double elapsedSec = static_cast<double>(shockwaveElapsedSamples) * ts;
                 if (elapsedSec < noiseDecay) {
-                    float env = 1.0f - static_cast<float>(elapsedSec / noiseDecay);
-                    
-                    // Stereo noise
-                    float rawNoiseL = (static_cast<float>(std::rand()) / RAND_MAX * 2.0f - 1.0f) * env;
-                    float rawNoiseR = (static_cast<float>(std::rand()) / RAND_MAX * 2.0f - 1.0f) * env;
+                    const float env = 1.0f - static_cast<float>(elapsedSec / noiseDecay);
+                    const float rawL = random.nextBipolar() * env;
+                    const float rawR = random.nextBipolar() * env;
 
-                    // Pass through 24dB/octave LPF (two 12dB LPFs in series)
-                    float filteredL = filter2L.processSample(0, filter1L.processSample(0, rawNoiseL));
-                    float filteredR = filter2R.processSample(0, filter1R.processSample(0, rawNoiseR));
-
-                    outL += filteredL;
-                    outR += filteredR;
-
+                    // 24 dB/octave low-pass = two 12 dB stages in series
+                    outL += filter2L.processSample(0, filter1L.processSample(0, rawL));
+                    outR += filter2R.processSample(0, filter1R.processSample(0, rawR));
                     shockwaveElapsedSamples++;
                 } else {
                     isShockwaveActive = false;
                 }
             }
 
-            // 2. Process Sub-bass Rumble (Sine wave with fast pitch sweep & exponential volume decay)
+            // 2. Sub rumble: sine with a fast pitch drop and an exponential tail
             if (isSubActive) {
-                double elapsedSec = subElapsedSamples * ts;
+                const double elapsedSec = static_cast<double>(subElapsedSamples) * ts;
                 if (elapsedSec < subDecay) {
-                    // Exponential pitch sweep: drops quickly in the first 75ms
                     const double pitchSweepDur = 0.075;
-                    float progress = static_cast<float>(std::min(1.0, elapsedSec / pitchSweepDur));
-                    float subFreq = subPitchEnd + (subPitchStart - subPitchEnd) * std::pow(1.0f - progress, 3.0f);
+                    const float progress = static_cast<float>(std::min(1.0, elapsedSec / pitchSweepDur));
+                    const float subFreq = subPitchEnd + (subPitchStart - subPitchEnd) * std::pow(1.0f - progress, 3.0f);
 
-                    // Exponential amplitude decay
-                    float ampEnv = std::exp(-static_cast<float>(elapsedSec) * (5.0f / subDecay));
+                    // Exponential tail, normalised so it reaches exactly zero (no click when it ends).
+                    const float raw = std::exp(-static_cast<float>(elapsedSec) * (5.0f / subDecay));
+                    const float ampEnv = juce::jmax(0.0f, (raw - endFloor) / (1.0f - endFloor));
 
-                    // Generate sine wave sample
-                    float subSample = std::sin(static_cast<float>(subPhase)) * ampEnv;
-
-                    // Centered pan
+                    const float subSample = std::sin(static_cast<float>(subPhase)) * ampEnv;
                     outL += subSample * 0.707f;
                     outR += subSample * 0.707f;
 
-                    // Advance sine phase
                     subPhase += 2.0 * juce::MathConstants<double>::pi * subFreq * ts;
-                    if (subPhase >= 2.0 * juce::MathConstants<double>::pi) {
+                    if (subPhase >= 2.0 * juce::MathConstants<double>::pi)
                         subPhase -= 2.0 * juce::MathConstants<double>::pi;
-                    }
-
                     subElapsedSamples++;
                 } else {
                     isSubActive = false;
                 }
             }
 
-            // Apply Boom Engine Volume and mix into the main buffer
             leftChannel[sample] += outL * volume;
             rightChannel[sample] += outR * volume;
         }
@@ -162,4 +160,7 @@ private:
 
     int64_t shockwaveElapsedSamples = 0;
     int64_t subElapsedSamples = 0;
+    int startDelay = 0;
+    uint32_t triggerCount = 0;
+    FastRandom random;
 };

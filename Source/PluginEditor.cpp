@@ -1,7 +1,7 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
-TransitionEngineAudioProcessorEditor::TransitionEngineAudioProcessorEditor(TransitionEngineAudioProcessor& p)
+RDSBAudioProcessorEditor::RDSBAudioProcessorEditor(RDSBAudioProcessor& p)
     : AudioProcessorEditor(&p), audioProcessor(p),
       keyboardComponent(p.keyboardState, juce::MidiKeyboardComponent::horizontalKeyboard)
 {
@@ -190,7 +190,7 @@ TransitionEngineAudioProcessorEditor::TransitionEngineAudioProcessorEditor(Trans
     startTimerHz(60);
 }
 
-TransitionEngineAudioProcessorEditor::~TransitionEngineAudioProcessorEditor()
+RDSBAudioProcessorEditor::~RDSBAudioProcessorEditor()
 {
     // Clean up look and feel pointers
     durationSlider.setLookAndFeel(nullptr);
@@ -243,7 +243,7 @@ TransitionEngineAudioProcessorEditor::~TransitionEngineAudioProcessorEditor()
     syncCombo.setLookAndFeel(nullptr);
 }
 
-void TransitionEngineAudioProcessorEditor::paint(juce::Graphics& g)
+void RDSBAudioProcessorEditor::paint(juce::Graphics& g)
 {
     // Sleek premium dark slate background
     g.fillAll(juce::Colour(0xFF101216));
@@ -340,7 +340,7 @@ void TransitionEngineAudioProcessorEditor::paint(juce::Graphics& g)
     g.drawText("PATTERN:", ax + 720, ay + 25, 80, 22, juce::Justification::right | juce::Justification::verticallyCentred);
 }
 
-void TransitionEngineAudioProcessorEditor::resized()
+void RDSBAudioProcessorEditor::resized()
 {
     // Header Bounds
     modeCombo.setBounds(280, 18, 120, 24);
@@ -426,13 +426,13 @@ void TransitionEngineAudioProcessorEditor::resized()
     keyboardComponent.setBounds(20, 660, 1110, 50);
 }
 
-void TransitionEngineAudioProcessorEditor::timerCallback()
+void RDSBAudioProcessorEditor::timerCallback()
 {
     // Repaint to update the real-time visualizer playhead position
     repaint();
 }
 
-void TransitionEngineAudioProcessorEditor::drawVisualizer(juce::Graphics& g, juce::Rectangle<int> area)
+void RDSBAudioProcessorEditor::drawVisualizer(juce::Graphics& g, juce::Rectangle<int> area)
 {
     auto modeVal = audioProcessor.apvts.getRawParameterValue("mode")->load();
     bool isDownlifter = (modeVal == 1.0f);

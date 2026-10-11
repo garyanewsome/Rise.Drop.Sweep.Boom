@@ -8,10 +8,10 @@
 #include "NoiseEngine.h"
 #include "BoomEngine.h"
 
-class TransitionEngineAudioProcessor : public juce::AudioProcessor {
+class RDSBAudioProcessor : public juce::AudioProcessor {
 public:
-    TransitionEngineAudioProcessor();
-    ~TransitionEngineAudioProcessor() override;
+    RDSBAudioProcessor();
+    ~RDSBAudioProcessor() override;
 
     void prepareToPlay(double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
@@ -62,9 +62,12 @@ private:
     // Phase Accumulation variables
     float masterPhase = 0.0f;
     bool isTransitionPlaying = false;
-    double lastHostBeat = 0.0;
     bool wasHostPlaying = false;
+    long long lastLoopIndex = 0;     // transport loop counter, for exact drop detection
+    bool haveLoopIndex = false;
+    bool boomOnNextBlock = false;   // a drop that fell exactly on a block boundary
+    double currentSampleRate = 44100.0;
     int triggerMidiNote = 36; // Default to C2 (36)
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(TransitionEngineAudioProcessor)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(RDSBAudioProcessor)
 };

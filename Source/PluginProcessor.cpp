@@ -1,66 +1,67 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
-TransitionEngineAudioProcessor::TransitionEngineAudioProcessor()
+RDSBAudioProcessor::RDSBAudioProcessor()
     : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
       apvts(*this, nullptr, "Parameters", createParameterLayout())
 {
 }
 
-TransitionEngineAudioProcessor::~TransitionEngineAudioProcessor()
+RDSBAudioProcessor::~RDSBAudioProcessor()
 {
 }
 
-const juce::String TransitionEngineAudioProcessor::getName() const
+const juce::String RDSBAudioProcessor::getName() const
 {
     return "Rise.Drop.Sweep.Boom";
 }
 
-bool TransitionEngineAudioProcessor::acceptsMidi() const
+bool RDSBAudioProcessor::acceptsMidi() const
 {
     return true;
 }
 
-bool TransitionEngineAudioProcessor::producesMidi() const
+bool RDSBAudioProcessor::producesMidi() const
 {
     return false;
 }
 
-bool TransitionEngineAudioProcessor::isMidiEffect() const
+bool RDSBAudioProcessor::isMidiEffect() const
 {
     return false;
 }
 
-double TransitionEngineAudioProcessor::getTailLengthSeconds() const
+double RDSBAudioProcessor::getTailLengthSeconds() const
 {
     return 4.0; // Reverb/Boom tail headroom
 }
 
-int TransitionEngineAudioProcessor::getNumPrograms()
+int RDSBAudioProcessor::getNumPrograms()
 {
     return 1;
 }
 
-int TransitionEngineAudioProcessor::getCurrentProgram()
+int RDSBAudioProcessor::getCurrentProgram()
 {
     return 0;
 }
 
-void TransitionEngineAudioProcessor::setCurrentProgram(int)
+void RDSBAudioProcessor::setCurrentProgram(int)
 {
 }
 
-const juce::String TransitionEngineAudioProcessor::getProgramName(int)
+const juce::String RDSBAudioProcessor::getProgramName(int)
 {
     return "Default";
 }
 
-void TransitionEngineAudioProcessor::changeProgramName(int, const juce::String&)
+void RDSBAudioProcessor::changeProgramName(int, const juce::String&)
 {
 }
 
-void TransitionEngineAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
+void RDSBAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
+    currentSampleRate = sampleRate;
     tonalSweeper.prepare(sampleRate);
 
     juce::dsp::ProcessSpec spec;
@@ -76,361 +77,341 @@ void TransitionEngineAudioProcessor::prepareToPlay(double sampleRate, int sample
     reverb.reset();
     phaser.reset();
     ladderFilter.reset();
+
+    masterPhase = 0.0f;
+    isTransitionPlaying = false;
+    wasHostPlaying = false;
+    boomOnNextBlock = false;
 }
 
-void TransitionEngineAudioProcessor::releaseResources()
+void RDSBAudioProcessor::releaseResources()
 {
 }
 
-bool TransitionEngineAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
+bool RDSBAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
 {
     if (layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
         return false;
     return true;
 }
 
-void TransitionEngineAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
+namespace {
+// Transparent below 0.9; above it eases into a hard ceiling at 1.0, so stacking
+// the engines (or +6 dB of master) can never clip the host.
+inline float softLimit(float x) {
+    constexpr float threshold = 0.9f, room = 1.0f - threshold;
+    const float a = std::abs(x);
+    if (a <= threshold)
+        return x;
+    return std::copysign(threshold + room * std::tanh((a - threshold) / room), x);
+}
+} // namespace
+
+void RDSBAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
 {
     juce::ScopedNoDenormals noDenormals;
-    int numSamples = buffer.getNumSamples();
+    const int numSamples = buffer.getNumSamples();
+    const double fs = currentSampleRate > 0.0 ? currentSampleRate : getSampleRate();
 
-    // 1. Clear the output buffer (we generate sound from scratch)
     buffer.clear();
-
-    // Feed on-screen keyboard midi notes into the buffer
     keyboardState.processNextMidiBuffer(midiMessages, 0, numSamples, true);
 
-    // Get parameters
-    auto mode = apvts.getRawParameterValue("mode")->load(); // 0 = Riser, 1 = Downlifter
-    auto syncMode = apvts.getRawParameterValue("sync_mode")->load(); // 0 = Transport, 1 = MIDI
-    auto durationBars = apvts.getRawParameterValue("duration_bars")->load();
-    auto boomTrigger = apvts.getRawParameterValue("boom_trigger_mode")->load(); // 0 = Auto, 1 = MIDI
+    // --- parameters (read once per block)
+    const bool downlifter = apvts.getRawParameterValue("mode")->load() > 0.5f;
+    const bool midiSync = apvts.getRawParameterValue("sync_mode")->load() > 0.5f;
+    const bool boomOnKey = apvts.getRawParameterValue("boom_trigger_mode")->load() > 0.5f;
+    const float durationBars = apvts.getRawParameterValue("duration_bars")->load();
+    const float warpK = apvts.getRawParameterValue("warp_k")->load();
 
-    // Parse incoming MIDI to trigger transitions or boom
-    for (const auto metadata : midiMessages)
-    {
-        auto message = metadata.getMessage();
-        if (message.isNoteOn())
-        {
-            triggerMidiNote = message.getNoteNumber();
-
-            if (syncMode == 1.0f) // MIDI Triggered Mode
-            {
-                triggerTransition();
-            }
-            else // Transport Synced Mode
-            {
-                if (boomTrigger == 1.0f) // Manual MIDI Boom
-                {
-                    boomEngine.trigger();
-                }
-            }
-
-            // Note-on always triggers boom in MIDI Boom mode regardless of sync mode
-            if (boomTrigger == 1.0f)
-            {
-                boomEngine.trigger();
+    // --- host timing
+    double bpm = 120.0, ppq = 0.0;
+    bool hostPlaying = false, haveBeat = false;
+    int sigNum = 4, sigDen = 4;
+    if (auto* ph = getPlayHead()) {
+        if (auto pos = ph->getPosition()) {
+            if (pos->getBpm().hasValue()) bpm = *pos->getBpm();
+            hostPlaying = pos->getIsPlaying();
+            if (pos->getPpqPosition().hasValue()) { ppq = *pos->getPpqPosition(); haveBeat = true; }
+            if (pos->getTimeSignature().hasValue()) {
+                sigNum = juce::jmax(1, pos->getTimeSignature()->numerator);
+                sigDen = juce::jmax(1, pos->getTimeSignature()->denominator);
             }
         }
     }
+    bpm = juce::jmax(1.0, bpm);
+    const double beatsPerSample = bpm / (60.0 * fs);                  // quarter-note beats
+    const double barBeats = sigNum * 4.0 / sigDen;                    // quarter notes per bar
+    const double transitionBeats = juce::jmax(1.0e-3, durationBars * barBeats);
 
-    // Get host tempo and timing details
-    double bpm = 120.0;
-    if (auto* ph = getPlayHead())
-    {
-        auto posInfo = ph->getPosition();
-        if (posInfo.hasValue() && posInfo->getBpm().hasValue())
-        {
-            bpm = *posInfo->getBpm();
+    // --- plan this block: up to two sweep segments plus sample-accurate boom triggers
+    struct Segment { int start, count; double phase, inc; };
+    Segment segments[2];
+    int numSegments = 0;
+    int autoBoomAt = -1;           // sample index of the drop, or -1
+    int midiBoomAt = -1;           // sample index of a MIDI-key boom, or -1
+
+    if (boomOnNextBlock) { autoBoomAt = 0; boomOnNextBlock = false; }
+
+    // Note-ons: remember the key (transpose) and sample position.
+    int midiStartAt = -1;
+    for (const auto metadata : midiMessages) {
+        const auto m = metadata.getMessage();
+        if (m.isNoteOn()) {
+            triggerMidiNote = m.getNoteNumber();
+            if (midiSync) midiStartAt = metadata.samplePosition;
+            if (boomOnKey && midiBoomAt < 0) midiBoomAt = metadata.samplePosition;
         }
     }
 
-    // 2. Phase accumulation & transport sync logic
-    if (syncMode == 1.0f) // MIDI Triggered
-    {
-        if (isTransitionPlaying)
-        {
-            // Advance phase based on sample duration and sample rate
-            double fs = getSampleRate();
-            double deltaPhi = bpm / (240.0 * fs * durationBars);
-            
-            masterPhase += static_cast<float>(deltaPhi * numSamples);
-
-            if (masterPhase >= 1.0f)
-            {
-                masterPhase = 1.0f;
+    if (midiSync) {
+        // One-shot: runs from the note-on for its length, then (riser) drops.
+        const double inc = beatsPerSample / transitionBeats;           // phase per sample
+        int from = 0;
+        if (midiStartAt >= 0) {
+            masterPhase = 0.0f;
+            isTransitionPlaying = true;
+            tonalSweeper.resetPumper();
+            from = midiStartAt;
+            if (downlifter && !boomOnKey) autoBoomAt = from;          // downlifters drop at the start
+        }
+        if (isTransitionPlaying) {
+            const double remaining = 1.0 - static_cast<double>(masterPhase);
+            const int samplesLeft = static_cast<int>(std::ceil(remaining / inc));
+            const int count = juce::jmin(numSamples - from, samplesLeft);
+            if (count > 0) {
+                segments[numSegments++] = { from, count, static_cast<double>(masterPhase), inc };
+                masterPhase = static_cast<float>(juce::jmin(1.0, masterPhase + inc * count));
+            }
+            if (count >= samplesLeft) {                                // reached the end
                 isTransitionPlaying = false;
-
-                // Riser auto-detonates boom at terminal capacity
-                if (mode == 0.0f && boomTrigger == 0.0f)
-                {
-                    boomEngine.trigger();
+                masterPhase = 1.0f;
+                if (!downlifter && !boomOnKey) {
+                    const int at = from + count;
+                    if (at < numSamples) autoBoomAt = at; else boomOnNextBlock = true;
                 }
             }
         }
-    }
-    else // Transport Synced
-    {
-        if (auto* ph = getPlayHead())
-        {
-            auto posInfo = ph->getPosition();
-            if (posInfo.hasValue())
-            {
-                bool hostIsPlaying = posInfo->getIsPlaying();
-                auto optBeat = posInfo->getPpqPosition();
+        wasHostPlaying = false;
+    } else {
+        // Transport-synced: the sweep is locked to the host's bar grid.
+        if (hostPlaying && haveBeat) {
+            const double inc = beatsPerSample / transitionBeats;
+            const double startFrac = std::fmod(ppq, transitionBeats) / transitionBeats;
 
-                if (hostIsPlaying && optBeat.hasValue())
-                {
-                    double currentBeat = *optBeat;
-                    double beatsPerBar = 4.0;
-                    if (posInfo->getTimeSignature().hasValue())
-                    {
-                        beatsPerBar = posInfo->getTimeSignature()->numerator;
-                    }
+            if (!wasHostPlaying && downlifter && !boomOnKey && startFrac < 1.0e-3)
+                autoBoomAt = 0;   // playback began exactly on the loop start
 
-                    double transitionBeats = durationBars * beatsPerBar;
-                    double rawPhase = std::fmod(currentBeat, transitionBeats) / transitionBeats;
-                    if (rawPhase < 0.0) rawPhase += 1.0;
+            // Loop boundaries are found by loop *index*, so a boundary that falls
+            // exactly on a block edge (or one rounding step either side) still fires once.
+            constexpr double eps = 1.0e-9;
+            auto loopIndex = [&](double beat) { return static_cast<long long>(std::floor(beat / transitionBeats + eps)); };
+            const long long idx0 = loopIndex(ppq);
+            const long long idxEnd = loopIndex(ppq + beatsPerSample * numSamples);
 
-                    float newPhase = static_cast<float>(rawPhase);
-
-                    // Check for drop events
-                    if (wasHostPlaying)
-                    {
-                        float diff = newPhase - masterPhase;
-                        if (diff < -0.5f) // Wrap-around loop boundary
-                        {
-                            if (boomTrigger == 0.0f)
-                            {
-                                boomEngine.trigger(); // Trigger for both risers (at end) and downlifters (at start of next loop)
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // Playback just started: Trigger Downlifter boom immediately
-                        if (mode == 1.0f && boomTrigger == 0.0f)
-                        {
-                            boomEngine.trigger();
-                        }
-                    }
-
-                    masterPhase = newPhase;
-                    isTransitionPlaying = true;
-                    wasHostPlaying = hostIsPlaying;
-                }
-                else
-                {
-                    isTransitionPlaying = false;
-                    wasHostPlaying = false;
-                    masterPhase = 0.0f;
-                }
+            int wrapAt = -1;
+            if (haveLoopIndex && idx0 > lastLoopIndex) {
+                wrapAt = 0;                                        // boundary was exactly at (or just before) this block
+            } else if (idxEnd > idx0) {
+                const double boundaryBeat = static_cast<double>(idx0 + 1) * transitionBeats;
+                const int at = static_cast<int>(std::ceil((boundaryBeat - ppq) / beatsPerSample - 1.0e-9));
+                wrapAt = juce::jlimit(0, numSamples, at);
+                if (wrapAt >= numSamples) wrapAt = -1;             // lands on the next block's first sample
             }
-        }
-        else
-        {
+            lastLoopIndex = (wrapAt >= 0 && idxEnd > idx0) ? idxEnd : idx0;
+            haveLoopIndex = true;
+
+            if (wrapAt > 0) {
+                segments[numSegments++] = { 0, wrapAt, startFrac, inc };
+                segments[numSegments++] = { wrapAt, numSamples - wrapAt, 0.0, inc };
+                masterPhase = static_cast<float>(inc * (numSamples - wrapAt));
+            } else if (wrapAt == 0) {
+                segments[numSegments++] = { 0, numSamples, 0.0, inc };
+                masterPhase = static_cast<float>(std::fmod(inc * numSamples, 1.0));
+            } else {
+                segments[numSegments++] = { 0, numSamples, startFrac, inc };
+                masterPhase = static_cast<float>(std::fmod(startFrac + inc * numSamples, 1.0));
+            }
+            if (wrapAt >= 0) {
+                if (!boomOnKey) autoBoomAt = wrapAt;
+                tonalSweeper.resetPumper();
+            }
+            isTransitionPlaying = true;
+            wasHostPlaying = true;
+        } else {
             isTransitionPlaying = false;
             wasHostPlaying = false;
+            haveLoopIndex = false;
             masterPhase = 0.0f;
         }
     }
 
-    // Determine active phase based on Mode (Riser = masterPhase, Downlifter = 1.0 - masterPhase)
-    float activePhase = (mode == 1.0f) ? (1.0f - masterPhase) : masterPhase;
-    auto warpK = apvts.getRawParameterValue("warp_k")->load();
+    // Boom triggers land on their exact sample.
+    if (autoBoomAt >= 0) boomEngine.trigger(autoBoomAt);
+    if (midiBoomAt >= 0) boomEngine.trigger(midiBoomAt);
 
-    // Calculate sample-accurate phase start and increment for this block
-    double fs = getSampleRate();
-    double deltaPhi = (isTransitionPlaying && fs > 0.0) ? (bpm / (240.0 * fs * durationBars)) : 0.0;
-    if (syncMode == 0.0f && (!wasHostPlaying || !isTransitionPlaying)) {
-        deltaPhi = 0.0;
+    // --- render the sweep segments
+    const int noteOffset = triggerMidiNote - 36;
+    const float tonalVol = apvts.getRawParameterValue("tonal_volume")->load();
+    const float noiseVol = apvts.getRawParameterValue("noise_volume")->load();
+    const float pitchStart = juce::jlimit(0.0f, 127.0f, apvts.getRawParameterValue("tonal_pitch_start")->load() + noteOffset);
+    const float pitchEnd = juce::jlimit(0.0f, 127.0f, apvts.getRawParameterValue("tonal_pitch_end")->load() + noteOffset);
+    const int unison = static_cast<int>(apvts.getRawParameterValue("tonal_unison")->load());
+    const float detune = apvts.getRawParameterValue("tonal_detune")->load();
+    const float spread = apvts.getRawParameterValue("tonal_pan_spread")->load();
+    const float pumpDepth = apvts.getRawParameterValue("pumper_depth")->load();
+    const float pumpStart = apvts.getRawParameterValue("pumper_rate_start")->load();
+    const float pumpEnd = apvts.getRawParameterValue("pumper_rate_end")->load();
+    const bool arpOn = apvts.getRawParameterValue("arp_enable")->load() > 0.5f;
+    const int arpRate = static_cast<int>(apvts.getRawParameterValue("arp_rate")->load());
+    const int arpPattern = static_cast<int>(apvts.getRawParameterValue("arp_pattern")->load());
+    const int noiseType = static_cast<int>(apvts.getRawParameterValue("noise_type")->load());
+    const int noiseFilterMode = static_cast<int>(apvts.getRawParameterValue("noise_filter_mode")->load());
+    const float cutoffStart = apvts.getRawParameterValue("noise_cutoff_start")->load();
+    const float cutoffEnd = apvts.getRawParameterValue("noise_cutoff_end")->load();
+    const float noiseQ = apvts.getRawParameterValue("noise_filter_q")->load();
+
+    for (int i = 0; i < numSegments; ++i) {
+        const auto& seg = segments[i];
+        // Downlifters sweep the same curve backwards.
+        const double phaseStart = downlifter ? 1.0 - seg.phase : seg.phase;
+        const double phaseInc = downlifter ? -seg.inc : seg.inc;
+
+        if (tonalVol > 0.0f)
+            tonalSweeper.processBlock(buffer, seg.start, seg.count, phaseStart, phaseInc, warpK, tonalVol,
+                                      pitchStart, pitchEnd, unison, detune, spread,
+                                      pumpDepth, pumpStart, pumpEnd, beatsPerSample, transitionBeats, downlifter,
+                                      arpOn, arpRate, arpPattern);
+        if (noiseVol > 0.0f)
+            noiseEngine.processBlock(buffer, seg.start, seg.count, phaseStart, phaseInc, warpK, noiseVol,
+                                     noiseType, noiseFilterMode, cutoffStart, cutoffEnd, noiseQ);
     }
 
-    double activePhaseStart = (mode == 1.0f) ? (1.0f - masterPhase) : masterPhase;
-    double activePhaseIncrement = (mode == 1.0f) ? -deltaPhi : deltaPhi;
-
-    // 3. Render Tonal Sweeper
-    if (isTransitionPlaying)
-    {
-        auto tonalVol = apvts.getRawParameterValue("tonal_volume")->load();
-        auto pitchStart = apvts.getRawParameterValue("tonal_pitch_start")->load();
-        auto pitchEnd = apvts.getRawParameterValue("tonal_pitch_end")->load();
-
-        // Calculate pitch shift relative to default C2 (MIDI 36)
-        int noteOffset = triggerMidiNote - 36;
-        float shiftedPitchStart = juce::jlimit(0.0f, 127.0f, pitchStart + noteOffset);
-        float shiftedPitchEnd = juce::jlimit(0.0f, 127.0f, pitchEnd + noteOffset);
-
-        auto unison = apvts.getRawParameterValue("tonal_unison")->load();
-        auto detune = apvts.getRawParameterValue("tonal_detune")->load();
-        auto spread = apvts.getRawParameterValue("tonal_pan_spread")->load();
-        auto pumpDepth = apvts.getRawParameterValue("pumper_depth")->load();
-        auto pumpStart = apvts.getRawParameterValue("pumper_rate_start")->load();
-        auto pumpEnd = apvts.getRawParameterValue("pumper_rate_end")->load();
-
-        // Arpeggiator params
-        auto arpEnable = apvts.getRawParameterValue("arp_enable")->load() == 1.0f;
-        auto arpRate = static_cast<int>(apvts.getRawParameterValue("arp_rate")->load());
-        auto arpPattern = static_cast<int>(apvts.getRawParameterValue("arp_pattern")->load());
-
-        tonalSweeper.processBlock(buffer, activePhaseStart, activePhaseIncrement, warpK, tonalVol,
-                                  shiftedPitchStart, shiftedPitchEnd, unison, detune, spread,
-                                  pumpDepth, pumpStart, pumpEnd, durationBars,
-                                  arpEnable, arpRate, arpPattern);
+    // --- boom
+    if (boomEngine.isActive()) {
+        const float freqMultiplier = std::pow(2.0f, static_cast<float>(noteOffset) / 12.0f);
+        boomEngine.processBlock(buffer,
+                                apvts.getRawParameterValue("boom_volume")->load(),
+                                apvts.getRawParameterValue("boom_noise_decay")->load(),
+                                apvts.getRawParameterValue("boom_sub_decay")->load(),
+                                juce::jlimit(40.0f, 1000.0f, apvts.getRawParameterValue("boom_sub_pitch_start")->load() * freqMultiplier),
+                                juce::jlimit(20.0f, 200.0f, apvts.getRawParameterValue("boom_sub_pitch_end")->load() * freqMultiplier));
     }
 
-    // 4. Render Noise Engine
-    if (isTransitionPlaying)
-    {
-        auto noiseVol = apvts.getRawParameterValue("noise_volume")->load();
-        auto noiseType = apvts.getRawParameterValue("noise_type")->load();
-        auto filterMode = apvts.getRawParameterValue("noise_filter_mode")->load();
-        auto cutoffStart = apvts.getRawParameterValue("noise_cutoff_start")->load();
-        auto cutoffEnd = apvts.getRawParameterValue("noise_cutoff_end")->load();
-        auto filterQ = apvts.getRawParameterValue("noise_filter_q")->load();
-
-        noiseEngine.processBlock(buffer, activePhase, warpK, noiseVol,
-                                 static_cast<int>(noiseType), static_cast<int>(filterMode),
-                                 cutoffStart, cutoffEnd, filterQ);
-    }
-
-    // 5. Render Boom Engine
-    if (boomEngine.isActive())
-    {
-        auto boomVol = apvts.getRawParameterValue("boom_volume")->load();
-        auto noiseDecay = apvts.getRawParameterValue("boom_noise_decay")->load();
-        auto subDecay = apvts.getRawParameterValue("boom_sub_decay")->load();
-        auto subPitchStart = apvts.getRawParameterValue("boom_sub_pitch_start")->load();
-        auto subPitchEnd = apvts.getRawParameterValue("boom_sub_pitch_end")->load();
-
-        // Sub-bass pitch tracks the key pressed (relative to C2 / note 36)
-        int noteOffset = triggerMidiNote - 36;
-        float freqMultiplier = std::pow(2.0f, static_cast<float>(noteOffset) / 12.0f);
-        float shiftedSubPitchStart = juce::jlimit(40.0f, 1000.0f, subPitchStart * freqMultiplier);
-        float shiftedSubPitchEnd = juce::jlimit(20.0f, 200.0f, subPitchEnd * freqMultiplier);
-
-        boomEngine.processBlock(buffer, boomVol, noiseDecay, subDecay, shiftedSubPitchStart, shiftedSubPitchEnd);
-    }
-
-    // 5.5. Render Phaser & Ladder Filter FX
-    auto phaserEnabled = apvts.getRawParameterValue("phaser_enable")->load();
-    if (phaserEnabled == 1.0f)
-    {
-        auto phaserFeedback = apvts.getRawParameterValue("phaser_feedback")->load();
-        auto phaserMix = apvts.getRawParameterValue("phaser_mix")->load();
-
-        phaser.setFeedback(phaserFeedback);
-        phaser.setMix(phaserMix);
-        phaser.setRate(1.0f);
-        phaser.setDepth(0.8f);
-        phaser.setCentreFrequency(400.0f + 1600.0f * std::pow(activePhase, warpK));
-
-        juce::dsp::AudioBlock<float> block(buffer);
-        juce::dsp::ProcessContextReplacing<float> context(block);
-        phaser.process(context);
-    }
-
-    auto filterEnabled = apvts.getRawParameterValue("filter_enable")->load();
-    if (filterEnabled == 1.0f)
-    {
-        auto filterMode = apvts.getRawParameterValue("filter_mode")->load();
-        auto filterResonance = apvts.getRawParameterValue("filter_resonance")->load();
-
-        if (filterMode == 1.0f)
-        {
-            ladderFilter.setMode(juce::dsp::LadderFilterMode::HPF24);
-            float cutoff = 20000.0f - (20000.0f - 30.0f) * std::pow(activePhase, warpK);
-            cutoff = juce::jlimit(20.0f, 20000.0f, cutoff);
-            ladderFilter.setCutoffFrequencyHz(cutoff);
+    // --- FX sweeps: follow the sweep position in short chunks
+    auto phaseAt = [&](int sample) -> double {
+        for (int i = 0; i < numSegments; ++i) {
+            const auto& seg = segments[i];
+            if (sample >= seg.start && sample < seg.start + seg.count)
+                return seg.phase + seg.inc * (sample - seg.start);
         }
-        else
-        {
-            ladderFilter.setMode(juce::dsp::LadderFilterMode::LPF24);
-            float cutoff = 100.0f + (20000.0f - 100.0f) * std::pow(activePhase, warpK);
-            cutoff = juce::jlimit(20.0f, 20000.0f, cutoff);
-            ladderFilter.setCutoffFrequencyHz(cutoff);
+        return static_cast<double>(masterPhase);
+    };
+
+    const bool phaserOn = apvts.getRawParameterValue("phaser_enable")->load() > 0.5f;
+    const bool filterOn = apvts.getRawParameterValue("filter_enable")->load() > 0.5f;
+    if (phaserOn || filterOn) {
+        const bool filterHighpass = apvts.getRawParameterValue("filter_mode")->load() > 0.5f;
+        if (phaserOn) {
+            phaser.setFeedback(apvts.getRawParameterValue("phaser_feedback")->load());
+            phaser.setMix(apvts.getRawParameterValue("phaser_mix")->load());
+            phaser.setRate(1.0f);
+            phaser.setDepth(0.8f);
+        }
+        if (filterOn) {
+            ladderFilter.setMode(filterHighpass ? juce::dsp::LadderFilterMode::HPF24
+                                                : juce::dsp::LadderFilterMode::LPF24);
+            ladderFilter.setResonance(apvts.getRawParameterValue("filter_resonance")->load());
         }
 
-        ladderFilter.setResonance(filterResonance);
+        constexpr int chunk = 64;
+        for (int offset = 0; offset < numSamples; offset += chunk) {
+            const int n = juce::jmin(chunk, numSamples - offset);
+            const double raw = juce::jlimit(0.0, 1.0, phaseAt(offset + n / 2));
+            const float active = static_cast<float>(downlifter ? 1.0 - raw : raw);
+            const float warped = std::pow(active, warpK);
 
-        juce::dsp::AudioBlock<float> block(buffer);
-        juce::dsp::ProcessContextReplacing<float> context(block);
-        ladderFilter.process(context);
+            float* chans[2] = { buffer.getWritePointer(0) + offset, buffer.getWritePointer(1) + offset };
+            juce::dsp::AudioBlock<float> block(chans, 2, static_cast<size_t>(n));
+            juce::dsp::ProcessContextReplacing<float> context(block);
+
+            if (phaserOn) {
+                phaser.setCentreFrequency(400.0f + 1600.0f * warped);
+                phaser.process(context);
+            }
+            if (filterOn) {
+                const float cutoff = filterHighpass ? 20000.0f - (20000.0f - 30.0f) * warped
+                                                    : 100.0f + (20000.0f - 100.0f) * warped;
+                ladderFilter.setCutoffFrequencyHz(juce::jlimit(20.0f, 20000.0f, cutoff));
+                ladderFilter.process(context);
+            }
+        }
     }
 
-    // 6. Waveshaper (Soft-Clipper)
-    auto drive = apvts.getRawParameterValue("saturation_drive")->load();
-    if (drive > 1.0f)
-    {
+    // --- saturation, master gain, reverb, safety limiter
+    const float drive = apvts.getRawParameterValue("saturation_drive")->load();
+    if (drive > 1.0f) {
         float* left = buffer.getWritePointer(0);
         float* right = buffer.getWritePointer(1);
-        float scaleComp = 1.0f / std::tanh(drive);
-
-        for (int i = 0; i < numSamples; ++i)
-        {
+        const float scaleComp = 1.0f / std::tanh(drive);
+        for (int i = 0; i < numSamples; ++i) {
             left[i] = std::tanh(drive * left[i]) * scaleComp;
             right[i] = std::tanh(drive * right[i]) * scaleComp;
         }
     }
 
-    // Apply master volume gain before spatial reverb
-    auto masterVol = juce::Decibels::decibelsToGain(apvts.getRawParameterValue("master_volume")->load());
-    buffer.applyGain(masterVol);
+    buffer.applyGain(juce::Decibels::decibelsToGain(apvts.getRawParameterValue("master_volume")->load()));
 
-    // 7. Spatial Reverb Routing
-    auto revMix = apvts.getRawParameterValue("reverb_mix")->load();
-    if (revMix > 0.0f)
-    {
-        auto revSize = apvts.getRawParameterValue("reverb_size")->load();
-        auto revWidth = apvts.getRawParameterValue("reverb_width")->load();
-
+    const float revMix = apvts.getRawParameterValue("reverb_mix")->load();
+    if (revMix > 0.0f) {
         juce::Reverb::Parameters revParams;
-        revParams.roomSize = revSize;
-        revParams.width = revWidth;
+        revParams.roomSize = apvts.getRawParameterValue("reverb_size")->load();
+        revParams.width = apvts.getRawParameterValue("reverb_width")->load();
         revParams.wetLevel = revMix;
         revParams.dryLevel = 1.0f - revMix;
         revParams.damping = 0.5f;
         reverb.setParameters(revParams);
+        reverb.processStereo(buffer.getWritePointer(0), buffer.getWritePointer(1), numSamples);
+    }
 
-        float* leftData = buffer.getWritePointer(0);
-        float* rightData = buffer.getWritePointer(1);
-        reverb.processStereo(leftData, rightData, numSamples);
+    float* outL = buffer.getWritePointer(0);
+    float* outR = buffer.getWritePointer(1);
+    for (int i = 0; i < numSamples; ++i) {
+        outL[i] = softLimit(outL[i]);
+        outR[i] = softLimit(outR[i]);
     }
 }
 
-void TransitionEngineAudioProcessor::triggerTransition()
+void RDSBAudioProcessor::triggerTransition()
 {
+    // Called from the UI TRIGGER button: start a transition on the next block.
     masterPhase = 0.0f;
     isTransitionPlaying = true;
+    tonalSweeper.resetPumper();
 
-    auto mode = apvts.getRawParameterValue("mode")->load();
-    auto boomTrigger = apvts.getRawParameterValue("boom_trigger_mode")->load();
-
-    // Downlifter drops immediately at phase 0.0
-    if (mode == 1.0f && boomTrigger == 0.0f)
-    {
-        boomEngine.trigger();
-    }
+    const bool downlifter = apvts.getRawParameterValue("mode")->load() > 0.5f;
+    const bool boomOnKey = apvts.getRawParameterValue("boom_trigger_mode")->load() > 0.5f;
+    if (downlifter && !boomOnKey)
+        boomOnNextBlock = true;
 }
 
-bool TransitionEngineAudioProcessor::hasEditor() const
+bool RDSBAudioProcessor::hasEditor() const
 {
     return true;
 }
 
-juce::AudioProcessorEditor* TransitionEngineAudioProcessor::createEditor()
+juce::AudioProcessorEditor* RDSBAudioProcessor::createEditor()
 {
-    return new TransitionEngineAudioProcessorEditor(*this);
+    return new RDSBAudioProcessorEditor(*this);
 }
 
-void TransitionEngineAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
+void RDSBAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
     std::unique_ptr<juce::XmlElement> xml(state.createXml());
     copyXmlToBinary(*xml, destData);
 }
 
-void TransitionEngineAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
+void RDSBAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
     std::unique_ptr<juce::XmlElement> xmlState(getXmlFromBinary(data, sizeInBytes));
     if (xmlState != nullptr)
@@ -442,7 +423,7 @@ void TransitionEngineAudioProcessor::setStateInformation(const void* data, int s
     }
 }
 
-juce::AudioProcessorValueTreeState::ParameterLayout TransitionEngineAudioProcessor::createParameterLayout()
+juce::AudioProcessorValueTreeState::ParameterLayout RDSBAudioProcessor::createParameterLayout()
 {
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> params;
 
@@ -460,7 +441,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout TransitionEngineAudioProcess
 
     // Tonal Sweeper Params
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID("tonal_volume", 1), "Tonal Volume", 0.0f, 1.0f, 0.7f));
+        juce::ParameterID("tonal_volume", 1), "Tonal Volume", 0.0f, 1.0f, 0.5f));
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
         juce::ParameterID("tonal_pitch_start", 1), "Tonal Start Pitch (MIDI)", 24.0f, 108.0f, 36.0f));
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
@@ -474,9 +455,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout TransitionEngineAudioProcess
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
         juce::ParameterID("pumper_depth", 1), "Pumper Depth", 0.0f, 1.0f, 0.0f));
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID("pumper_rate_start", 1), "Pumper Rate Start (Hz)", 1.0f, 32.0f, 4.0f));
+        juce::ParameterID("pumper_rate_start", 1), "Pumper Rate Start (per beat)", 0.25f, 8.0f, 1.0f));
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID("pumper_rate_end", 1), "Pumper Rate End (Hz)", 1.0f, 32.0f, 16.0f));
+        juce::ParameterID("pumper_rate_end", 1), "Pumper Rate End (per beat)", 0.25f, 8.0f, 4.0f));
 
     // Arpeggiator Params
     params.push_back(std::make_unique<juce::AudioParameterChoice>(
@@ -488,7 +469,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout TransitionEngineAudioProcess
 
     // Noise Engine Params
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID("noise_volume", 1), "Noise Volume", 0.0f, 1.0f, 0.5f));
+        juce::ParameterID("noise_volume", 1), "Noise Volume", 0.0f, 1.0f, 0.35f));
     params.push_back(std::make_unique<juce::AudioParameterChoice>(
         juce::ParameterID("noise_type", 1), "Noise Type", juce::StringArray("White Noise", "Pink Noise"), 0));
     params.push_back(std::make_unique<juce::AudioParameterChoice>(
@@ -502,7 +483,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout TransitionEngineAudioProcess
 
     // Boom Engine Params
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID("boom_volume", 1), "Boom Volume", 0.0f, 1.0f, 0.8f));
+        juce::ParameterID("boom_volume", 1), "Boom Volume", 0.0f, 1.0f, 0.6f));
     params.push_back(std::make_unique<juce::AudioParameterChoice>(
         juce::ParameterID("boom_trigger_mode", 1), "Boom Trigger Mode", juce::StringArray("Auto (Drop)", "MIDI Key"), 0));
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
@@ -546,5 +527,5 @@ juce::AudioProcessorValueTreeState::ParameterLayout TransitionEngineAudioProcess
 // Boilerplate creator function for VST/AU entry points
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
-    return new TransitionEngineAudioProcessor();
+    return new RDSBAudioProcessor();
 }

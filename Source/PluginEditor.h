@@ -51,12 +51,12 @@ public:
     }
 };
 
-class TransitionEngineAudioProcessorEditor : public juce::AudioProcessorEditor,
+class RDSBAudioProcessorEditor : public juce::AudioProcessorEditor,
                                              private juce::Timer
 {
 public:
-    TransitionEngineAudioProcessorEditor(TransitionEngineAudioProcessor&);
-    ~TransitionEngineAudioProcessorEditor() override;
+    RDSBAudioProcessorEditor(RDSBAudioProcessor&);
+    ~RDSBAudioProcessorEditor() override;
 
     void paint(juce::Graphics&) override;
     void resized() override;
@@ -65,7 +65,7 @@ private:
     void timerCallback() override;
     void drawVisualizer(juce::Graphics& g, juce::Rectangle<int> area);
 
-    TransitionEngineAudioProcessor& audioProcessor;
+    RDSBAudioProcessor& audioProcessor;
     CustomLookAndFeel customLookAndFeel;
 
     // Header Controls
@@ -188,5 +188,5 @@ private:
     std::unique_ptr<ComboBoxAttachment> filterModeAttach;
     std::unique_ptr<SliderAttachment> filterResonanceAttach;
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(TransitionEngineAudioProcessorEditor)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(RDSBAudioProcessorEditor)
 };
