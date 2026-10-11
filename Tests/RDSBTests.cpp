@@ -368,6 +368,24 @@ int main(int argc, char** argv) {
         check(ri_start.size() == 1 && ri_start[0] < 100, "riser AT START: one boom at the start");
     }
 
+
+    {
+        std::cout << "[13] The selected preset name survives saving and restoring plugin state\n";
+        RDSBAudioProcessor a;
+        a.setPlayConfigDetails(0, 2, 48000.0, 512);
+        a.prepareToPlay(48000.0, 512);
+        a.setCurrentProgram(2);                         // host program change remembers the name
+        const juce::String expected = a.getProgramName(2);
+        check(a.apvts.state.getProperty("presetName").toString() == expected, "program change records the name (" + expected + ")");
+        juce::MemoryBlock blob;
+        a.getStateInformation(blob);
+        RDSBAudioProcessor b;
+        b.setPlayConfigDetails(0, 2, 48000.0, 512);
+        b.prepareToPlay(48000.0, 512);
+        b.setStateInformation(blob.getData(), (int) blob.getSize());
+        check(b.apvts.state.getProperty("presetName").toString() == expected, "name is restored with the state");
+    }
+
     std::cout << (failures == 0 ? "\nALL PASSED\n" : "\nFAILURES: " + std::to_string(failures) + "\n");
     return failures == 0 ? 0 : 1;
 }

@@ -53,6 +53,7 @@ void RDSBAudioProcessor::setCurrentProgram(int index)
         return;
     currentProgram = index;
     Presets::applyFactory(*this, index);
+    apvts.state.setProperty("presetName", Presets::factory()[static_cast<size_t>(index)].name, nullptr);
 }
 
 const juce::String RDSBAudioProcessor::getProgramName(int index)

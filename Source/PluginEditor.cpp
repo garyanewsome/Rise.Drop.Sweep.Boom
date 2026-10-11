@@ -165,6 +165,8 @@ RDSBAudioProcessorEditor::RDSBAudioProcessorEditor(RDSBAudioProcessor& p)
     presetBox.setTooltip("Choose a factory or saved preset.");
     presetBox.setColour(juce::ComboBox::outlineColourId, white.withAlpha(0.7f));
     presetBox.onChange = [this] {
+    // Remember the choice in the plugin state so it survives the window being closed and reopened.
+    audioProcessor.apvts.state.setProperty("presetName", presetBox.getItemText(presetBox.getSelectedItemIndex()), nullptr);
         const int id = presetBox.getSelectedId();
         const int nFactory = (int) Presets::factory().size();
         if (id >= 1 && id <= nFactory) Presets::applyFactory(audioProcessor, id - 1);
@@ -185,6 +187,16 @@ RDSBAudioProcessorEditor::RDSBAudioProcessorEditor(RDSBAudioProcessor& p)
     addAndMakeVisible(nextPresetButton);
     addAndMakeVisible(savePresetButton);
     refreshPresetList();
+  {
+    // Reselect the remembered preset (the editor is rebuilt every time the window opens).
+    const juce::String remembered = audioProcessor.apvts.state.getProperty("presetName").toString();
+    if (remembered.isNotEmpty())
+      for (int i = 0; i < presetBox.getNumItems(); ++i)
+        if (presetBox.getItemText(i) == remembered) {
+          presetBox.setSelectedItemIndex(i, juce::dontSendNotification);
+          break;
+        }
+  }
 
     // ---- Keyboard
     keyboard.setColour(juce::MidiKeyboardComponent::keyDownOverlayColourId, violet.withAlpha(0.75f));
@@ -289,7 +301,7 @@ void RDSBAudioProcessorEditor::promptSavePreset() {
     w->enterModalState(true, juce::ModalCallbackFunction::create([this, w](int result) {
         if (result == 1) {
             const auto name = w->getTextEditorContents("name").trim();
-            if (name.isNotEmpty() && Presets::saveUser(audioProcessor, name)) refreshPresetList(name);
+            if (name.isNotEmpty() && Presets::saveUser(audioProcessor, name)) { audioProcessor.apvts.state.setProperty("presetName", name, nullptr); refreshPresetList(name); }
         }
     }), true);
 }
