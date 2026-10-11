@@ -125,8 +125,13 @@ void RDSBAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
 
     // --- parameters (read once per block)
     const bool downlifter = apvts.getRawParameterValue("mode")->load() > 0.5f;
-    const bool midiSync = apvts.getRawParameterValue("sync_mode")->load() > 0.5f;
+    const bool midiSyncParam = apvts.getRawParameterValue("sync_mode")->load() > 0.5f;
     const bool boomOnKey = apvts.getRawParameterValue("boom_trigger_mode")->load() > 0.5f;
+    // Where the impact falls on the sweep (in time): 0 at the drop (riser: end,
+    // downlifter: start), 1 start, 2 end, 3 both.
+    const int boomPos = static_cast<int>(apvts.getRawParameterValue("boom_position")->load());
+    const bool boomAtStart = boomPos == 1 || boomPos == 3 || (boomPos == 0 && downlifter);
+    const bool boomAtEnd   = boomPos == 2 || boomPos == 3 || (boomPos == 0 && !downlifter);
     const float durationBars = apvts.getRawParameterValue("duration_bars")->load();
     const float warpK = apvts.getRawParameterValue("warp_k")->load();
 
@@ -146,6 +151,11 @@ void RDSBAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
         }
     }
     bpm = juce::jmax(1.0, bpm);
+
+    // The sweep is locked to the transport only while the host is actually
+    // playing. Otherwise (MIDI mode, a stopped DAW, or the standalone app) a
+    // key or the TRIGGER button plays the transition once, so it is never dead.
+    const bool midiSync = midiSyncParam || !(hostPlaying && haveBeat);
     const double beatsPerSample = bpm / (60.0 * fs);                  // quarter-note beats
     const double barBeats = sigNum * 4.0 / sigDen;                    // quarter notes per bar
     const double transitionBeats = juce::jmax(1.0e-3, durationBars * barBeats);
@@ -179,7 +189,7 @@ void RDSBAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
             isTransitionPlaying = true;
             tonalSweeper.resetPumper();
             from = midiStartAt;
-            if (downlifter && !boomOnKey) autoBoomAt = from;          // downlifters drop at the start
+            if (boomAtStart && !boomOnKey) autoBoomAt = from;
         }
         if (isTransitionPlaying) {
             const double remaining = 1.0 - static_cast<double>(masterPhase);
@@ -192,7 +202,7 @@ void RDSBAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
             if (count >= samplesLeft) {                                // reached the end
                 isTransitionPlaying = false;
                 masterPhase = 1.0f;
-                if (!downlifter && !boomOnKey) {
+                if (boomAtEnd && !boomOnKey) {
                     const int at = from + count;
                     if (at < numSamples) autoBoomAt = at; else boomOnNextBlock = true;
                 }
@@ -205,7 +215,7 @@ void RDSBAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
             const double inc = beatsPerSample / transitionBeats;
             const double startFrac = std::fmod(ppq, transitionBeats) / transitionBeats;
 
-            if (!wasHostPlaying && downlifter && !boomOnKey && startFrac < 1.0e-3)
+            if (!wasHostPlaying && boomAtStart && !boomOnKey && startFrac < 1.0e-3)
                 autoBoomAt = 0;   // playback began exactly on the loop start
 
             // Loop boundaries are found by loop *index*, so a boundary that falls
@@ -239,7 +249,8 @@ void RDSBAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
                 masterPhase = static_cast<float>(std::fmod(startFrac + inc * numSamples, 1.0));
             }
             if (wrapAt >= 0) {
-                if (!boomOnKey) autoBoomAt = wrapAt;
+                // A loop boundary is the end of one pass and the start of the next.
+                if (!boomOnKey && (boomAtStart || boomAtEnd)) autoBoomAt = wrapAt;
                 tonalSweeper.resetPumper();
             }
             isTransitionPlaying = true;
@@ -399,7 +410,9 @@ void RDSBAudioProcessor::triggerTransition()
 
     const bool downlifter = apvts.getRawParameterValue("mode")->load() > 0.5f;
     const bool boomOnKey = apvts.getRawParameterValue("boom_trigger_mode")->load() > 0.5f;
-    if (downlifter && !boomOnKey)
+    const int boomPos = static_cast<int>(apvts.getRawParameterValue("boom_position")->load());
+    const bool boomAtStart = boomPos == 1 || boomPos == 3 || (boomPos == 0 && downlifter);
+    if (boomAtStart && !boomOnKey)
         boomOnNextBlock = true;
 }
 
@@ -495,6 +508,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout RDSBAudioProcessor::createPa
         juce::ParameterID("boom_volume", 1), "Boom Volume", 0.0f, 1.0f, 0.6f));
     params.push_back(std::make_unique<juce::AudioParameterChoice>(
         juce::ParameterID("boom_trigger_mode", 1), "Boom Trigger Mode", juce::StringArray("Auto (Drop)", "MIDI Key"), 0));
+    params.push_back(std::make_unique<juce::AudioParameterChoice>(
+        juce::ParameterID("boom_position", 1), "Boom Position",
+        juce::StringArray("At Drop", "At Start", "At End", "Start + End"), 0));
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
         juce::ParameterID("boom_noise_decay", 1), "Boom Punch Decay (s)", 0.05f, 0.5f, 0.1f));
     params.push_back(std::make_unique<juce::AudioParameterFloat>(

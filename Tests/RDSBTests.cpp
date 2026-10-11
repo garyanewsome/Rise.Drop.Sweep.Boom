@@ -2,7 +2,7 @@
 //   cmake --build cmake-build --target RDSBTests
 //   cmake-build/RDSBTests_artefacts/Release/RDSBTests
 // A fake DAW transport drives the real processor offline.
-//   RDSBTests --snapshot out.png   renders the editor offscreen.
+//   RDSBTests --snapshot out.png [preset#]   renders the editor offscreen.
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <cmath>
@@ -12,6 +12,7 @@
 
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "Presets.h"
 
 namespace {
 
@@ -98,6 +99,8 @@ int main(int argc, char** argv) {
         RDSBAudioProcessor proc;
         proc.setPlayConfigDetails(0, 2, 48000.0, 512);
         proc.prepareToPlay(48000.0, 512);
+        // Optional 3rd argument: factory preset index to apply first.
+        if (argc >= 4) proc.setCurrentProgram(juce::String(argv[3]).getIntValue());
         std::unique_ptr<juce::AudioProcessorEditor> ed(proc.createEditor());
         ed->setVisible(true);
         auto img = ed->createComponentSnapshot(ed->getLocalBounds(), true, 1.0f);
@@ -268,6 +271,101 @@ int main(int argc, char** argv) {
             std::cout << "        " << proc.getProgramName(i) << ": peak " << pk << (ok ? "" : "  <-- BAD") << "\n";
         }
         check(all, "all " + juce::String(count) + " presets are finite, audible and within full scale");
+    }
+
+    {
+        std::cout << "[10] Presets actually set their parameters, and play in the standalone (no transport)\n";
+        RDSBAudioProcessor probe;
+        bool sticks = true, plays = true;
+        for (int i = 0; i < probe.getNumPrograms(); ++i) {
+            RDSBAudioProcessor proc;
+            proc.setPlayConfigDetails(0, 2, 48000.0, 512);
+            proc.prepareToPlay(48000.0, 512);          // NOTE: no play head, like the standalone app
+            proc.setCurrentProgram(i);
+
+            // 1. every value the preset lists must have landed on the parameter
+            const auto& preset = Presets::factory()[(size_t) i];
+            for (const auto& kv : preset.values) {
+                const float actual = proc.apvts.getRawParameterValue(kv.first)->load();
+                if (std::abs(actual - kv.second) > 0.02f * std::max(1.0f, std::abs(kv.second))) {
+                    std::cout << "        " << preset.name << ": " << kv.first << " wanted " << kv.second << " got " << actual << "\n";
+                    sticks = false;
+                }
+            }
+
+            // 2. play a key: the preset must make sound without any host transport
+            float pk = 0;
+            juce::AudioBuffer<float> buf(2, 512);
+            for (int b = 0; b < 300; ++b) {
+                juce::MidiBuffer midi;
+                if (b == 0) midi.addEvent(juce::MidiMessage::noteOn(1, 36, 1.0f), 0);
+                proc.processBlock(buf, midi);
+                for (int c = 0; c < 2; ++c)
+                    for (int n = 0; n < 512; ++n) pk = std::max(pk, std::abs(buf.getSample(c, n)));
+            }
+            if (pk < 0.01f) { std::cout << "        " << preset.name << ": SILENT in the standalone (sync_mode "
+                                        << proc.apvts.getRawParameterValue("sync_mode")->load() << ")\n"; plays = false; }
+        }
+        check(sticks, "every listed preset value lands on its parameter");
+        check(plays, "every preset makes sound when a key is played with no host transport");
+    }
+
+    {
+        std::cout << "[11] TRANSPORT mode with a stopped transport still previews on a key / TRIGGER\n";
+        RDSBAudioProcessor proc;
+        FakeHost host; host.playing = false;
+        proc.setPlayHead(&host);
+        proc.setPlayConfigDetails(0, 2, 48000.0, 512);
+        proc.prepareToPlay(48000.0, 512);
+        setParam(proc, "sync_mode", 0.0f);        // TRANSPORT
+        setParam(proc, "duration_bars", 1.0f);
+        float quiet = 0, pkKey = 0, pkTrig = 0;
+        juce::AudioBuffer<float> buf(2, 512);
+        for (int b = 0; b < 40; ++b) {            // stopped, nothing played: silence
+            juce::MidiBuffer m; proc.processBlock(buf, m);
+            for (int n = 0; n < 512; ++n) quiet = std::max(quiet, std::abs(buf.getSample(0, n)));
+        }
+        for (int b = 0; b < 100; ++b) {           // play a key
+            juce::MidiBuffer m;
+            if (b == 0) m.addEvent(juce::MidiMessage::noteOn(1, 36, 1.0f), 0);
+            proc.processBlock(buf, m);
+            for (int n = 0; n < 512; ++n) pkKey = std::max(pkKey, std::abs(buf.getSample(0, n)));
+        }
+        proc.triggerTransition();                  // the TRIGGER button
+        for (int b = 0; b < 100; ++b) {
+            juce::MidiBuffer m; proc.processBlock(buf, m);
+            for (int n = 0; n < 512; ++n) pkTrig = std::max(pkTrig, std::abs(buf.getSample(0, n)));
+        }
+        check(quiet < 1e-6f, "stopped and untouched: silent");
+        check(pkKey > 0.02f, "a key previews the transition (peak " + juce::String(pkKey, 3) + ")");
+        check(pkTrig > 0.02f, "the TRIGGER button previews it (peak " + juce::String(pkTrig, 3) + ")");
+    }
+
+    {
+        std::cout << "[12] BOOM AT: a downlifter can land with a boom, a riser can start with one\n";
+        // One-shot, 1 bar @120 = 96000 samples; boom isolated; render well past the end.
+        auto boomOnsets = [&](float mode, float position) {
+            Params p = { {"mode", mode}, {"boom_position", position}, {"tonal_volume", 0.0f}, {"noise_volume", 0.0f},
+                         {"duration_bars", 1.0f}, {"reverb_mix", 0.0f}, {"boom_volume", 1.0f},
+                         {"boom_sub_decay", 0.5f}, {"boom_noise_decay", 0.05f} };
+            auto r = run(512, 130000, false, 0.0, p, true);
+            std::vector<int> starts;
+            bool quiet = true;
+            int window = 0;
+            for (int i = 0; i < (int) r.l.size(); ++i) {
+                if (std::abs(r.l[(size_t) i]) > 0.001f) { if (quiet) starts.push_back(i); quiet = false; window = 0; }
+                else if (++window > 6000) quiet = true;       // a gap of silence separates two booms
+            }
+            return starts;
+        };
+        auto dl_default = boomOnsets(1.0f, 0.0f), dl_end = boomOnsets(1.0f, 2.0f), dl_both = boomOnsets(1.0f, 3.0f);
+        auto ri_default = boomOnsets(0.0f, 0.0f), ri_start = boomOnsets(0.0f, 1.0f);
+        check(dl_default.size() == 1 && dl_default[0] < 100, "downlifter AT DROP: one boom at the start");
+        check(dl_end.size() == 1 && dl_end[0] > 95900 && dl_end[0] < 96100, "downlifter AT END: one boom at the end (sample "
+                                                                            + juce::String(dl_end.empty() ? -1 : dl_end[0]) + ")");
+        check(dl_both.size() == 2 && dl_both[0] < 100 && dl_both[1] > 95900 && dl_both[1] < 96100, "downlifter START + END: two booms");
+        check(ri_default.size() == 1 && ri_default[0] > 95900 && ri_default[0] < 96100, "riser AT DROP: one boom at the end");
+        check(ri_start.size() == 1 && ri_start[0] < 100, "riser AT START: one boom at the start");
     }
 
     std::cout << (failures == 0 ? "\nALL PASSED\n" : "\nFAILURES: " + std::to_string(failures) + "\n");

@@ -40,7 +40,8 @@ RDSBAudioProcessorEditor::RDSBAudioProcessorEditor(RDSBAudioProcessor& p)
     addChoice(modeCombo, "mode", juce::StringArray("RISER", "DOWNLIFTER"),
               "Riser builds up to the drop. Downlifter drops first, then falls away.", white);
     addChoice(syncCombo, "sync_mode", juce::StringArray("TRANSPORT", "MIDI"),
-              "TRANSPORT locks the sweep to the DAW's bar grid and loops. MIDI plays it once "
+              "TRANSPORT locks the sweep to the DAW's bar grid and loops while the DAW plays "
+              "(when it is stopped, a key or TRIGGER previews it once). MIDI plays it once "
               "from each note you play.", white);
     triggerButton.setButtonText("TRIGGER");
     triggerButton.setTooltip("Start a transition now (MIDI mode). Same as playing a key.");
@@ -102,6 +103,9 @@ RDSBAudioProcessorEditor::RDSBAudioProcessorEditor(RDSBAudioProcessor& p)
     boomVol.slider.textFromValueFunction = percent; boomVol.slider.valueFromTextFunction = percentFrom;
     addChoice(boomTrigger, "boom_trigger_mode", juce::StringArray("AUTO DROP", "MIDI KEY"),
               "AUTO fires the impact at the drop. MIDI KEY fires it only when you play a key.", orange);
+    addChoice(boomPosition, "boom_position", juce::StringArray("AT DROP", "AT START", "AT END", "START + END"),
+              "Where the impact lands. AT DROP is the classic: end of a riser, start of a downlifter. "
+              "AT END lands a downlifter with a boom. START + END gives both.", orange);
     addKnob(punchDecay, "boom_noise_decay", "PUNCH", "How long the sharp noise hit at the front of the impact lasts.", orange);
     punchDecay.slider.textFromValueFunction = seconds;
     addKnob(rumbleDecay, "boom_sub_decay", "RUMBLE", "How long the deep sub tail rings out.", orange);
@@ -149,7 +153,7 @@ RDSBAudioProcessorEditor::RDSBAudioProcessorEditor(RDSBAudioProcessor& p)
         {"TONAL SWEEP", violet, {}, {}, {&tonalVol, &pitchStart, &pitchEnd, &unison, &detune, &width, &pumpDepth, &pumpStart, &pumpEnd}, 5, 5.0f, {}},
         {"ARP",         violet, {&arpEnable}, {&arpRate, &arpPattern}, {}, 1, 1.9f, {}},
         {"NOISE",       cyan,   {}, {&noiseType, &noiseFilterMode}, {&noiseVol, &cutStart, &cutEnd, &noiseQ}, 4, 3.6f, {}},
-        {"BOOM",        orange, {}, {&boomTrigger}, {&boomVol, &punchDecay, &rumbleDecay, &subStart, &subEnd}, 5, 4.4f, {}},
+        {"BOOM",        orange, {}, {&boomTrigger, &boomPosition}, {&boomVol, &punchDecay, &rumbleDecay, &subStart, &subEnd}, 5, 4.4f, {}},
         {"FX",          lime,   {&phaserEnable, &filterEnable}, {&filterMode}, {&phaserMix, &phaserFeedback, &filterRes}, 3, 3.0f, {}},
         {"SPACE",       pink,   {}, {}, {&revMix, &revSize, &revWidth}, 3, 2.7f, {}},
         {"SHAPE & OUT", white,  {}, {}, {&warp, &drive, &master}, 3, 2.7f, {}},
@@ -451,14 +455,19 @@ void RDSBAudioProcessorEditor::drawVisualizer(juce::Graphics& g, juce::Rectangle
     const float bars = param("duration_bars");
     const float k = param("warp_k");
 
-    // Timeline: riser = sweep then boom; downlifter = boom then sweep.
-    const float boomFrac = 0.17f;
+    // Where the impact(s) fall, in time: before the sweep, after it, or both.
+    const int boomPos = static_cast<int>(param("boom_position"));
+    const bool boomAtStart = boomPos == 1 || boomPos == 3 || (boomPos == 0 && downlifter);
+    const bool boomAtEnd   = boomPos == 2 || boomPos == 3 || (boomPos == 0 && !downlifter);
+
+    // Timeline: [boom?] sweep [boom?]
+    const float boomFrac = 0.14f;
     const float pad = 8.0f;
     const float left = f.getX() + pad, width = f.getWidth() - pad * 2.0f;
     const float top = f.getY() + 24.0f, bottom = f.getBottom() - 14.0f, hgt = bottom - top;
-    const float sweepW = width * (1.0f - boomFrac), boomW = width * boomFrac;
-    const float sweepX = downlifter ? left + boomW : left;
-    const float boomX = downlifter ? left : left + sweepW;
+    const float boomW = width * boomFrac;
+    const float sweepW = width - boomW * ((boomAtStart ? 1 : 0) + (boomAtEnd ? 1 : 0));
+    const float sweepX = left + (boomAtStart ? boomW : 0.0f);
 
     // grid
     g.setColour(juce::Colours::white.withAlpha(0.045f));
@@ -556,49 +565,57 @@ void RDSBAudioProcessorEditor::drawVisualizer(juce::Graphics& g, juce::Rectangle
         }
     }
 
-    // --- Boom (orange): punch spike then the sub tail
+    // --- Boom (orange): punch spike then the sub tail, at the start and/or end
     if (param("boom_volume") > 0.001f) {
         const float punch = param("boom_noise_decay"), rumble = param("boom_sub_decay");
         const float total = juce::jmax(rumble, 0.1f);
-        juce::Path tail;
-        const float x0 = boomX;
-        tail.startNewSubPath(x0, bottom);
-        for (int i = 0; i <= 80; ++i) {
-            const float t = (float) i / 80.0f * total;
-            const float raw = std::exp(-t * (5.0f / rumble));
-            const float env = juce::jmax(0.0f, (raw - std::exp(-5.0f)) / (1.0f - std::exp(-5.0f)));
-            const float x = downlifter ? x0 + (float) i / 80.0f * boomW : x0 + (float) i / 80.0f * boomW;
-            tail.lineTo(x, yFor(0.15f + 0.8f * env * param("boom_volume")));
-        }
-        tail.lineTo(x0 + boomW, bottom);
-        tail.closeSubPath();
-        g.setGradientFill(juce::ColourGradient(LAF::orange.withAlpha(0.5f), 0, top, LAF::orange.withAlpha(0.05f), 0, bottom, false));
-        g.fillPath(tail);
-        g.setColour(LAF::orange);
-        g.strokePath(tail, juce::PathStrokeType(1.6f));
+        const float endFloor = std::exp(-5.0f);
 
-        // punch spike: short bright burst at the front of the impact
-        const float spikeW = juce::jlimit(3.0f, boomW * 0.4f, boomW * (punch / total) * 3.0f);
-        g.setColour(juce::Colours::white.withAlpha(0.9f));
-        g.fillRect(x0, yFor(0.98f), spikeW * 0.35f, bottom - yFor(0.98f));
-        g.setColour(LAF::orange.withAlpha(0.35f));
-        g.fillRect(x0, yFor(0.98f), spikeW, bottom - yFor(0.98f));
+        auto drawBoom = [&](float x0, bool label) {
+            juce::Path tail;
+            tail.startNewSubPath(x0, bottom);
+            for (int i = 0; i <= 80; ++i) {
+                const float t = (float) i / 80.0f * total;
+                const float raw = std::exp(-t * (5.0f / rumble));
+                const float env = juce::jmax(0.0f, (raw - endFloor) / (1.0f - endFloor));
+                tail.lineTo(x0 + (float) i / 80.0f * boomW, yFor(0.15f + 0.8f * env * param("boom_volume")));
+            }
+            tail.lineTo(x0 + boomW, bottom);
+            tail.closeSubPath();
+            g.setGradientFill(juce::ColourGradient(LAF::orange.withAlpha(0.5f), 0, top, LAF::orange.withAlpha(0.05f), 0, bottom, false));
+            g.fillPath(tail);
+            g.setColour(LAF::orange);
+            g.strokePath(tail, juce::PathStrokeType(1.6f));
 
-        g.setFont(LAF::monoFont(9.0f, true));
-        g.setColour(LAF::orange);
-        g.drawText("BOOM", (int) x0 + 4, (int) top - 2, 60, 12, juce::Justification::left, false);
+            const float spikeW = juce::jlimit(3.0f, boomW * 0.4f, boomW * (punch / total) * 3.0f);
+            g.setColour(juce::Colours::white.withAlpha(0.9f));
+            g.fillRect(x0, yFor(0.98f), spikeW * 0.35f, bottom - yFor(0.98f));
+            g.setColour(LAF::orange.withAlpha(0.35f));
+            g.fillRect(x0, yFor(0.98f), spikeW, bottom - yFor(0.98f));
+
+            if (label) {
+                g.setFont(LAF::monoFont(9.0f, true));
+                g.setColour(LAF::orange);
+                g.drawText("BOOM", (int) x0 + 4, (int) top - 2, 60, 12, juce::Justification::left, false);
+            }
+        };
+        if (boomAtStart) drawBoom(left, true);
+        if (boomAtEnd) drawBoom(sweepX + sweepW, true);
     }
 
-    // Drop line between sweep and boom.
+    // Drop lines where the sweep meets an impact.
     {
-        const float dx = downlifter ? sweepX : sweepX + sweepW;
         g.setColour(juce::Colours::white.withAlpha(0.35f));
         float dashes[] = { 3.0f, 3.0f };
-        juce::Path line, dashed;
-        line.startNewSubPath(dx, top - 4.0f);
-        line.lineTo(dx, bottom);
-        juce::PathStrokeType(1.0f).createDashedStroke(dashed, line, dashes, 2);
-        g.fillPath(dashed);
+        auto dropLine = [&](float dx) {
+            juce::Path line, dashed;
+            line.startNewSubPath(dx, top - 4.0f);
+            line.lineTo(dx, bottom);
+            juce::PathStrokeType(1.0f).createDashedStroke(dashed, line, dashes, 2);
+            g.fillPath(dashed);
+        };
+        if (boomAtStart) dropLine(sweepX);
+        if (boomAtEnd) dropLine(sweepX + sweepW);
     }
 
     // Playhead

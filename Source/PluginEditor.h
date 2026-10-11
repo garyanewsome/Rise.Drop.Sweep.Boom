@@ -77,7 +77,7 @@ private:
     Choice noiseType, noiseFilterMode;
     // Boom
     Knob boomVol, punchDecay, rumbleDecay, subStart, subEnd;
-    Choice boomTrigger;
+    Choice boomTrigger, boomPosition;
     // FX
     Toggle phaserEnable, filterEnable;
     Knob phaserMix, phaserFeedback, filterRes;
