@@ -157,6 +157,11 @@ int main(int argc, char** argv) {
         const double pre = peakOf(a) * std::pow(10.0, 12.0 / 20.0);
         std::cout << "        pre-limiter peak ~ " << pre << " (" << 20.0 * std::log10(pre) << " dBFS)\n";
         check(pre < 1.0, "default patch peaks below full scale before the limiter");
+
+        auto wet = run(512, 130000, false, 0.0, { {"duration_bars", 1.0f}, {"master_volume", -12.0f}, {"reverb_mix", 0.3f} }, true);
+        const double preWet = peakOf(wet) * std::pow(10.0, 12.0 / 20.0);
+        std::cout << "        with the default 30% reverb: ~" << preWet << " (" << 20.0 * std::log10(preWet) << " dBFS)\n";
+        check(preWet < 1.0, "turning the reverb on does not push the mix over full scale");
     }
 
     {
@@ -232,6 +237,37 @@ int main(int argc, char** argv) {
         auto r = run(256, 80000, true, 0.0, boomOnly, false, 120.0, 3);
         const int at = firstAbove(r.l, 0, 0.0005f);
         check(at >= 72000 && at <= 72002, "3/4 bar = 72000 samples, drop at " + juce::String(at));
+    }
+
+    {
+        std::cout << "[9] Every factory preset loads, is audible and stays within full scale\n";
+        RDSBAudioProcessor probe;
+        const int count = probe.getNumPrograms();
+        bool all = true;
+        for (int i = 0; i < count; ++i) {
+            RDSBAudioProcessor proc;
+            FakeHost host; host.ppq = 0.0;
+            proc.setPlayHead(&host);
+            proc.setPlayConfigDetails(0, 2, 48000.0, 512);
+            proc.prepareToPlay(48000.0, 512);
+            proc.setCurrentProgram(i);
+            // Short loops make the drop land inside the window.
+            setParam(proc, "duration_bars", std::min(proc.apvts.getRawParameterValue("duration_bars")->load(), 1.0f));
+            float pk = 0; bool fin = true;
+            juce::AudioBuffer<float> buf(2, 512);
+            for (int b = 0; b < 400; ++b) {
+                juce::MidiBuffer midi;
+                if (b == 0) midi.addEvent(juce::MidiMessage::noteOn(1, 36, 1.0f), 0);
+                proc.processBlock(buf, midi);
+                for (int c = 0; c < 2; ++c)
+                    for (int n = 0; n < 512; ++n) { const float v = buf.getSample(c, n); fin &= std::isfinite(v); pk = std::max(pk, std::abs(v)); }
+                host.ppq += 512.0 / 48000.0 * 2.0;
+            }
+            const bool ok = fin && pk > 0.02f && pk <= 1.0f;
+            all &= ok;
+            std::cout << "        " << proc.getProgramName(i) << ": peak " << pk << (ok ? "" : "  <-- BAD") << "\n";
+        }
+        check(all, "all " + juce::String(count) + " presets are finite, audible and within full scale");
     }
 
     std::cout << (failures == 0 ? "\nALL PASSED\n" : "\nFAILURES: " + std::to_string(failures) + "\n");

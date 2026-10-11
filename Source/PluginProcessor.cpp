@@ -373,8 +373,10 @@ void RDSBAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
         juce::Reverb::Parameters revParams;
         revParams.roomSize = apvts.getRawParameterValue("reverb_size")->load();
         revParams.width = apvts.getRawParameterValue("reverb_width")->load();
-        revParams.wetLevel = revMix;
-        revParams.dryLevel = 1.0f - revMix;
+        // juce::Reverb silently scales dry by 2x and wet by 3x; undo that so
+        // the mix control is a plain crossfade and enabling reverb is not a level jump.
+        revParams.wetLevel = revMix / 3.0f;
+        revParams.dryLevel = (1.0f - revMix) * 0.5f;
         revParams.damping = 0.5f;
         reverb.setParameters(revParams);
         reverb.processStereo(buffer.getWritePointer(0), buffer.getWritePointer(1), numSamples);
