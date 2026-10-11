@@ -65,6 +65,7 @@ private:
     bool wasHostPlaying = false;
     long long lastLoopIndex = 0;     // transport loop counter, for exact drop detection
     bool haveLoopIndex = false;
+    int currentProgram = 0;
     bool boomOnNextBlock = false;   // a drop that fell exactly on a block boundary
     double currentSampleRate = 44100.0;
     int triggerMidiNote = 36; // Default to C2 (36)

@@ -67,20 +67,36 @@ jobs:
         run: |
           set -e
           for f in \
-            "build/RiseDropSweepBoom_artefacts/Release/VST3/Rise.Drop.Sweep.Boom.vst3/Contents/MacOS/Rise.Drop.Sweep.Boom" \
-            "build/RiseDropSweepBoom_artefacts/Release/AU/Rise.Drop.Sweep.Boom.component/Contents/MacOS/Rise.Drop.Sweep.Boom" \
-            "build/RiseDropSweepBoom_artefacts/Release/Standalone/Rise.Drop.Sweep.Boom.app/Contents/MacOS/Rise.Drop.Sweep.Boom"; do
+            "build/RDSB_artefacts/Release/VST3/Rise.Drop.Sweep.Boom.vst3/Contents/MacOS/Rise.Drop.Sweep.Boom" \
+            "build/RDSB_artefacts/Release/AU/Rise.Drop.Sweep.Boom.component/Contents/MacOS/Rise.Drop.Sweep.Boom" \
+            "build/RDSB_artefacts/Release/Standalone/Rise.Drop.Sweep.Boom.app/Contents/MacOS/Rise.Drop.Sweep.Boom"; do
             echo "== $f =="
             lipo -info "$f" | grep -q "x86_64 arm64" || { echo "not universal: $f"; exit 1; }
           done
 
       - name: Package
         run: |
-          cd build/RiseDropSweepBoom_artefacts/Release
-          zip -r "${GITHUB_WORKSPACE}/RiseDropSweepBoom-macOS-universal.zip" VST3 AU Standalone
+          cd build/RDSB_artefacts/Release
+          zip -r "${GITHUB_WORKSPACE}/RDSB-macOS-universal.zip" VST3 AU Standalone
+
+      - name: Build installer disk image
+        # Double-click installer + uninstaller for non-technical users.
+        # Unsigned unless Developer ID secrets are added (see installer/).
+        env:
+          DESCRIPTION: a transition generator for risers, downlifters, sweeps and impacts
+        run: ./installer/build_installer.sh build/RDSB_artefacts/Release
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: RiseDropSweepBoom-macOS-universal.zip
+          files: |
+            RDSB-macOS-universal.zip
+            dist/*-macOS.dmg
           generate_release_notes: true
+          body: |
+            **Easiest install:** download the `.dmg`, open it, and double-click the *Install* package.
+            The installer is not yet signed with an Apple developer certificate, so macOS will ask
+            you to approve it once - the steps are in *READ ME FIRST.txt* inside the disk image.
+            The `.zip` is the raw VST3 / AU / Standalone bundles for manual installs.
+
+            Requires macOS 14 or newer. Universal: Intel and Apple Silicon.

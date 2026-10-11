@@ -1,528 +1,634 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "Presets.h"
 
+namespace {
+constexpr int kBaseWidth = 1280;
+constexpr int kBaseHeight = 700;
+constexpr int kHeaderHeight = 66;
+constexpr int kVisualizerHeight = 190;
+constexpr int kRow1Height = 214;
+constexpr int kRow2Height = 198;
+
+using LAF = RDSBLookAndFeel;
+
+double leadingNumber(const juce::String& t) { return t.retainCharacters("+-.0123456789").getDoubleValue(); }
+juce::String percent(double v) { return juce::String(juce::roundToInt(v * 100.0)) + " %"; }
+double percentFrom(const juce::String& t) { return leadingNumber(t) / 100.0; }
+juce::String hz(double v) {
+    return v < 1000.0 ? juce::String(juce::roundToInt(v)) + " Hz" : juce::String(v / 1000.0, 1) + " kHz";
+}
+double hzFrom(const juce::String& t) {
+    const double n = leadingNumber(t);
+    return t.containsIgnoreCase("k") ? n * 1000.0 : n;
+}
+juce::String noteName(double midi) { return juce::MidiMessage::getMidiNoteName(juce::roundToInt(midi), true, true, 4); }
+juce::String seconds(double v) { return juce::String(v, 2) + " s"; }
+} // namespace
+
+//==============================================================================
 RDSBAudioProcessorEditor::RDSBAudioProcessorEditor(RDSBAudioProcessor& p)
     : AudioProcessorEditor(&p), audioProcessor(p),
-      keyboardComponent(p.keyboardState, juce::MidiKeyboardComponent::horizontalKeyboard)
+      keyboard(p.keyboardState, juce::MidiKeyboardComponent::horizontalKeyboard)
 {
-    // Helper to initialize rotary sliders
-    auto initKnob = [this](juce::Slider& s, const juce::String& suffix) {
-        s.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-        s.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 50, 15);
-        s.setTextValueSuffix(suffix);
-        s.setLookAndFeel(&customLookAndFeel);
-        addAndMakeVisible(s);
-    };
+    setLookAndFeel(&lookAndFeel);
 
-    // Helper to initialize ComboBoxes
-    auto initCombo = [this](juce::ComboBox& c, const juce::StringArray& items) {
-        c.setLookAndFeel(&customLookAndFeel);
-        c.addItemList(items, 1);
-        addAndMakeVisible(c);
-    };
+    const auto violet = LAF::violet, cyan = LAF::cyan, orange = LAF::orange;
+    const auto lime = LAF::lime, pink = LAF::pink, white = LAF::white;
 
-    // Helper to initialize ToggleButtons
-    auto initToggle = [this](juce::ToggleButton& b, const juce::String& text) {
-        b.setButtonText(text);
-        b.setLookAndFeel(&customLookAndFeel);
-        addAndMakeVisible(b);
-    };
-
-    // Global / Header Controls
-    initCombo(modeCombo, juce::StringArray("Riser", "Downlifter"));
-    modeAttach = std::make_unique<ComboBoxAttachment>(audioProcessor.apvts, "mode", modeCombo);
-
-    initCombo(syncCombo, juce::StringArray("Transport Synced", "MIDI Triggered"));
-    syncAttach = std::make_unique<ComboBoxAttachment>(audioProcessor.apvts, "sync_mode", syncCombo);
-
-    // Bar length (Linear horizontal slider in header)
-    durationSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-    durationSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 40, 15);
-    durationSlider.setLookAndFeel(&customLookAndFeel);
-    addAndMakeVisible(durationSlider);
-    durationAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "duration_bars", durationSlider);
-
+    // ---- Header
+    addChoice(modeCombo, "mode", juce::StringArray("RISER", "DOWNLIFTER"),
+              "Riser builds up to the drop. Downlifter drops first, then falls away.", white);
+    addChoice(syncCombo, "sync_mode", juce::StringArray("TRANSPORT", "MIDI"),
+              "TRANSPORT locks the sweep to the DAW's bar grid and loops. MIDI plays it once "
+              "from each note you play.", white);
     triggerButton.setButtonText("TRIGGER");
-    triggerButton.setLookAndFeel(&customLookAndFeel);
+    triggerButton.setTooltip("Start a transition now (MIDI mode). Same as playing a key.");
+    triggerButton.setColour(juce::TextButton::textColourOffId, white);
     triggerButton.onClick = [this] { audioProcessor.triggerTransition(); };
     addAndMakeVisible(triggerButton);
 
-    // Tonal Sweeper Sliders
-    initKnob(tonalVolSlider, "");
-    tonalVolAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "tonal_volume", tonalVolSlider);
+    addKnob(barsKnob, "duration_bars", "BARS",
+            "Length of the transition in bars. The sweep takes exactly this long, then drops.", white);
+    barsKnob.slider.textFromValueFunction = [](double v) { return juce::String(v, 1) + " bars"; };
 
-    initKnob(tonalPitchStartSlider, "");
-    tonalPitchStartAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "tonal_pitch_start", tonalPitchStartSlider);
+    // ---- Tonal sweeper
+    addKnob(tonalVol, "tonal_volume", "LEVEL", "How loud the pitched saw riser is.", violet);
+    tonalVol.slider.textFromValueFunction = percent; tonalVol.slider.valueFromTextFunction = percentFrom;
+    addKnob(pitchStart, "tonal_pitch_start", "START",
+            "Pitch the riser begins on. The note you play transposes it.", violet);
+    pitchStart.slider.textFromValueFunction = noteName;
+    addKnob(pitchEnd, "tonal_pitch_end", "END", "Pitch the riser reaches at the drop.", violet);
+    pitchEnd.slider.textFromValueFunction = noteName;
+    addKnob(unison, "tonal_unison", "VOICES",
+            "Number of stacked, slightly detuned saws. More is wider and thicker.", violet);
+    addKnob(detune, "tonal_detune", "DETUNE", "How far apart the stacked saws are tuned.", violet);
+    detune.slider.textFromValueFunction = percent; detune.slider.valueFromTextFunction = percentFrom;
+    addKnob(width, "tonal_pan_spread", "SPREAD", "How widely the stacked saws spread across the stereo field.", violet);
+    width.slider.textFromValueFunction = percent; width.slider.valueFromTextFunction = percentFrom;
+    addKnob(pumpDepth, "pumper_depth", "PUMP",
+            "Sidechain-style pumping: how deeply the riser ducks on each pulse. Zero is off.", violet);
+    pumpDepth.slider.textFromValueFunction = percent; pumpDepth.slider.valueFromTextFunction = percentFrom;
+    addKnob(pumpStart, "pumper_rate_start", "FROM",
+            "Pump speed at the start of the sweep, in pulses per beat (1 = quarter notes, 4 = 16ths).", violet);
+    pumpStart.slider.textFromValueFunction = [](double v) { return juce::String(v, 2) + "/beat"; };
+    addKnob(pumpEnd, "pumper_rate_end", "TO",
+            "Pump speed at the end of the sweep. Higher than FROM makes the pulses speed up.", violet);
+    pumpEnd.slider.textFromValueFunction = [](double v) { return juce::String(v, 2) + "/beat"; };
 
-    initKnob(tonalPitchEndSlider, "");
-    tonalPitchEndAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "tonal_pitch_end", tonalPitchEndSlider);
+    addToggle(arpEnable, "arp_enable", "ARP",
+              "Plays the riser as a rising arpeggio (root, third, fifth, octave) instead of a smooth glide.", violet);
+    addChoice(arpRate, "arp_rate", juce::StringArray("1/8", "1/16", "1/32"),
+              "How fast the arpeggio steps.", violet);
+    addChoice(arpPattern, "arp_pattern", juce::StringArray("UP", "DOWN", "UP-DOWN", "OCTAVES"),
+              "The order the arpeggio plays its notes in.", violet);
 
-    initKnob(tonalUnisonSlider, "");
-    tonalUnisonAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "tonal_unison", tonalUnisonSlider);
+    // ---- Noise
+    addKnob(noiseVol, "noise_volume", "LEVEL", "How loud the noise whoosh is.", cyan);
+    noiseVol.slider.textFromValueFunction = percent; noiseVol.slider.valueFromTextFunction = percentFrom;
+    addChoice(noiseType, "noise_type", juce::StringArray("WHITE", "PINK"),
+              "White is bright and hissy. Pink is softer and fuller.", cyan);
+    addChoice(noiseFilterMode, "noise_filter_mode", juce::StringArray("BAND-PASS", "HIGH-PASS"),
+              "Band-pass is a focused whoosh. High-pass opens into airy hiss.", cyan);
+    addKnob(cutStart, "noise_cutoff_start", "FROM", "Where the noise filter starts its sweep.", cyan);
+    cutStart.slider.textFromValueFunction = hz; cutStart.slider.valueFromTextFunction = hzFrom;
+    addKnob(cutEnd, "noise_cutoff_end", "TO", "Where the noise filter ends up at the drop.", cyan);
+    cutEnd.slider.textFromValueFunction = hz; cutEnd.slider.valueFromTextFunction = hzFrom;
+    addKnob(noiseQ, "noise_filter_q", "FOCUS", "How narrow and whistling the noise filter is.", cyan);
+    noiseQ.slider.textFromValueFunction = [](double v) { return juce::String(v, 1); };
 
-    initKnob(tonalDetuneSlider, "");
-    tonalDetuneAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "tonal_detune", tonalDetuneSlider);
+    // ---- Boom
+    addKnob(boomVol, "boom_volume", "LEVEL", "How loud the impact is.", orange);
+    boomVol.slider.textFromValueFunction = percent; boomVol.slider.valueFromTextFunction = percentFrom;
+    addChoice(boomTrigger, "boom_trigger_mode", juce::StringArray("AUTO DROP", "MIDI KEY"),
+              "AUTO fires the impact at the drop. MIDI KEY fires it only when you play a key.", orange);
+    addKnob(punchDecay, "boom_noise_decay", "PUNCH", "How long the sharp noise hit at the front of the impact lasts.", orange);
+    punchDecay.slider.textFromValueFunction = seconds;
+    addKnob(rumbleDecay, "boom_sub_decay", "RUMBLE", "How long the deep sub tail rings out.", orange);
+    rumbleDecay.slider.textFromValueFunction = seconds;
+    addKnob(subStart, "boom_sub_pitch_start", "DROP FROM", "Pitch the sub starts on before it falls.", orange);
+    subStart.slider.textFromValueFunction = hz; subStart.slider.valueFromTextFunction = hzFrom;
+    addKnob(subEnd, "boom_sub_pitch_end", "DROP TO", "The low note the sub settles on.", orange);
+    subEnd.slider.textFromValueFunction = hz; subEnd.slider.valueFromTextFunction = hzFrom;
 
-    initKnob(tonalPanSpreadSlider, "");
-    tonalPanSpreadAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "tonal_pan_spread", tonalPanSpreadSlider);
+    // ---- FX
+    addToggle(phaserEnable, "phaser_enable", "PHASER", "Adds a swirling phaser that follows the sweep.", lime);
+    addKnob(phaserMix, "phaser_mix", "MIX", "How much phaser is blended in.", lime);
+    phaserMix.slider.textFromValueFunction = percent; phaserMix.slider.valueFromTextFunction = percentFrom;
+    addKnob(phaserFeedback, "phaser_feedback", "DEPTH", "How intense and resonant the phaser is.", lime);
+    phaserFeedback.slider.textFromValueFunction = percent; phaserFeedback.slider.valueFromTextFunction = percentFrom;
+    addToggle(filterEnable, "filter_enable", "FILTER", "Sweeps a filter over the whole mix with the transition.", lime);
+    addChoice(filterMode, "filter_mode", juce::StringArray("LOW-PASS", "HIGH-PASS"),
+              "Low-pass opens up as it rises. High-pass clears out the low end as it rises.", lime);
+    addKnob(filterRes, "filter_resonance", "RESO", "How much the filter resonates around the cutoff.", lime);
+    filterRes.slider.textFromValueFunction = percent; filterRes.slider.valueFromTextFunction = percentFrom;
 
-    initKnob(pumperDepthSlider, "");
-    pumperDepthAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "pumper_depth", pumperDepthSlider);
+    // ---- Space / global
+    addKnob(revMix, "reverb_mix", "REVERB", "How much reverb is blended in. Great for a long tail on the drop.", pink);
+    revMix.slider.textFromValueFunction = percent; revMix.slider.valueFromTextFunction = percentFrom;
+    addKnob(revSize, "reverb_size", "SIZE", "How big the reverb room is.", pink);
+    revSize.slider.textFromValueFunction = percent; revSize.slider.valueFromTextFunction = percentFrom;
+    addKnob(revWidth, "reverb_width", "WIDTH", "How wide the reverb is across the stereo field.", pink);
+    revWidth.slider.textFromValueFunction = percent; revWidth.slider.valueFromTextFunction = percentFrom;
+    addKnob(warp, "warp_k", "CURVE",
+            "Shape of the sweep. Low is even; higher holds back and rushes up at the end for more tension.", white);
+    warp.slider.textFromValueFunction = [](double v) { return juce::String(v, 1); };
+    addKnob(drive, "saturation_drive", "DRIVE", "Saturation: adds grit and presence to the whole mix.", white);
+    drive.slider.textFromValueFunction = [](double v) { return juce::String(v, 1) + " x"; };
+    addKnob(master, "master_volume", "MASTER", "Overall output level in decibels.", white);
+    master.slider.textFromValueFunction = [](double v) { return juce::String(v, 1) + " dB"; };
 
-    initKnob(pumperRateStartSlider, " Hz");
-    pumperRateStartAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "pumper_rate_start", pumperRateStartSlider);
+    for (auto* k : {&barsKnob, &tonalVol, &pitchStart, &pitchEnd, &unison, &detune, &width, &pumpDepth, &pumpStart,
+                    &pumpEnd, &noiseVol, &cutStart, &cutEnd, &noiseQ, &boomVol, &punchDecay, &rumbleDecay,
+                    &subStart, &subEnd, &phaserMix, &phaserFeedback, &filterRes, &revMix, &revSize, &revWidth,
+                    &warp, &drive, &master})
+        k->slider.updateText();
 
-    initKnob(pumperRateEndSlider, " Hz");
-    pumperRateEndAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "pumper_rate_end", pumperRateEndSlider);
+    // ---- Sections and rows
+    sections = {
+        {"TONAL SWEEP", violet, {}, {}, {&tonalVol, &pitchStart, &pitchEnd, &unison, &detune, &width, &pumpDepth, &pumpStart, &pumpEnd}, 5, 5.0f, {}},
+        {"ARP",         violet, {&arpEnable}, {&arpRate, &arpPattern}, {}, 1, 1.9f, {}},
+        {"NOISE",       cyan,   {}, {&noiseType, &noiseFilterMode}, {&noiseVol, &cutStart, &cutEnd, &noiseQ}, 4, 3.6f, {}},
+        {"BOOM",        orange, {}, {&boomTrigger}, {&boomVol, &punchDecay, &rumbleDecay, &subStart, &subEnd}, 5, 4.4f, {}},
+        {"FX",          lime,   {&phaserEnable, &filterEnable}, {&filterMode}, {&phaserMix, &phaserFeedback, &filterRes}, 3, 3.0f, {}},
+        {"SPACE",       pink,   {}, {}, {&revMix, &revSize, &revWidth}, 3, 2.7f, {}},
+        {"SHAPE & OUT", white,  {}, {}, {&warp, &drive, &master}, 3, 2.7f, {}},
+    };
+    rows = { {0, 1, 2, 3}, {4, 5, 6} };
 
-    // Noise Engine
-    initKnob(noiseVolSlider, "");
-    noiseVolAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "noise_volume", noiseVolSlider);
+    // ---- Preset browser
+    presetBox.setTextWhenNothingSelected("- PRESET -");
+    presetBox.setTooltip("Choose a factory or saved preset.");
+    presetBox.setColour(juce::ComboBox::outlineColourId, white.withAlpha(0.7f));
+    presetBox.onChange = [this] {
+        const int id = presetBox.getSelectedId();
+        const int nFactory = (int) Presets::factory().size();
+        if (id >= 1 && id <= nFactory) Presets::applyFactory(audioProcessor, id - 1);
+        else if (id > 1000 && id - 1001 < userPresetFiles.size()) Presets::loadUser(audioProcessor, userPresetFiles[id - 1001]);
+    };
+    addAndMakeVisible(presetBox);
 
-    initCombo(noiseTypeCombo, juce::StringArray("White Noise", "Pink Noise"));
-    noiseTypeAttach = std::make_unique<ComboBoxAttachment>(audioProcessor.apvts, "noise_type", noiseTypeCombo);
+    prevPresetButton.setButtonText("<");
+    nextPresetButton.setButtonText(">");
+    savePresetButton.setButtonText("SAVE");
+    prevPresetButton.setTooltip("Previous preset.");
+    nextPresetButton.setTooltip("Next preset.");
+    savePresetButton.setTooltip("Save the current sound as a preset.");
+    prevPresetButton.onClick = [this] { stepPreset(-1); };
+    nextPresetButton.onClick = [this] { stepPreset(1); };
+    savePresetButton.onClick = [this] { promptSavePreset(); };
+    addAndMakeVisible(prevPresetButton);
+    addAndMakeVisible(nextPresetButton);
+    addAndMakeVisible(savePresetButton);
+    refreshPresetList();
 
-    initCombo(noiseFilterModeCombo, juce::StringArray("Bandpass", "Highpass"));
-    noiseFilterModeAttach = std::make_unique<ComboBoxAttachment>(audioProcessor.apvts, "noise_filter_mode", noiseFilterModeCombo);
+    // ---- Keyboard
+    keyboard.setColour(juce::MidiKeyboardComponent::keyDownOverlayColourId, violet.withAlpha(0.75f));
+    keyboard.setColour(juce::MidiKeyboardComponent::mouseOverKeyOverlayColourId, cyan.withAlpha(0.35f));
+    keyboard.setColour(juce::MidiKeyboardComponent::whiteNoteColourId, juce::Colour(0xff1a1a24));
+    keyboard.setColour(juce::MidiKeyboardComponent::blackNoteColourId, juce::Colours::black);
+    keyboard.setColour(juce::MidiKeyboardComponent::keySeparatorLineColourId, juce::Colours::white.withAlpha(0.18f));
+    keyboard.setColour(juce::MidiKeyboardComponent::textLabelColourId, LAF::dimText);
+    keyboard.setAvailableRange(24, 96);
+    keyboard.setScrollButtonsVisible(false);
+    addAndMakeVisible(keyboard);
 
-    initKnob(noiseCutoffStartSlider, " Hz");
-    noiseCutoffStartAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "noise_cutoff_start", noiseCutoffStartSlider);
-
-    initKnob(noiseCutoffEndSlider, " Hz");
-    noiseCutoffEndAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "noise_cutoff_end", noiseCutoffEndSlider);
-
-    initKnob(noiseFilterQSlider, "");
-    noiseFilterQAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "noise_filter_q", noiseFilterQSlider);
-
-    // Boom Engine
-    initKnob(boomVolSlider, "");
-    boomVolAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "boom_volume", boomVolSlider);
-
-    initCombo(boomTriggerCombo, juce::StringArray("Auto (Drop)", "MIDI Key"));
-    boomTriggerAttach = std::make_unique<ComboBoxAttachment>(audioProcessor.apvts, "boom_trigger_mode", boomTriggerCombo);
-
-    initKnob(boomNoiseDecaySlider, "s");
-    boomNoiseDecayAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "boom_noise_decay", boomNoiseDecaySlider);
-
-    initKnob(boomSubDecaySlider, "s");
-    boomSubDecayAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "boom_sub_decay", boomSubDecaySlider);
-
-    initKnob(boomSubPitchStartSlider, " Hz");
-    boomSubPitchStartAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "boom_sub_pitch_start", boomSubPitchStartSlider);
-
-    initKnob(boomSubPitchEndSlider, " Hz");
-    boomSubPitchEndAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "boom_sub_pitch_end", boomSubPitchEndSlider);
-
-    // FX / Master
-    initKnob(saturationDriveSlider, "x");
-    saturationDriveAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "saturation_drive", saturationDriveSlider);
-
-    initKnob(reverbMixSlider, "");
-    reverbMixAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "reverb_mix", reverbMixSlider);
-
-    initKnob(reverbSizeSlider, "");
-    reverbSizeAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "reverb_size", reverbSizeSlider);
-
-    initKnob(reverbWidthSlider, "");
-    reverbWidthAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "reverb_width", reverbWidthSlider);
-
-    initKnob(warpKSlider, "");
-    warpKAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "warp_k", warpKSlider);
-
-    initKnob(masterVolSlider, " dB");
-    masterVolAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "master_volume", masterVolSlider);
-
-    // Group Boxes
-    tonalGroup.setText("TONAL SWEEPER");
-    addAndMakeVisible(tonalGroup);
-
-    noiseGroup.setText("NOISE ENGINE");
-    addAndMakeVisible(noiseGroup);
-
-    boomGroup.setText("BOOM ENGINE");
-    addAndMakeVisible(boomGroup);
-
-    masterGroup.setText("MASTER & FX");
-    addAndMakeVisible(masterGroup);
-
-    // Phaser Controls
-    initToggle(phaserEnableButton, "Phaser Enable");
-    phaserEnableAttach = std::make_unique<ButtonAttachment>(audioProcessor.apvts, "phaser_enable", phaserEnableButton);
-
-    initKnob(phaserFeedbackSlider, "");
-    phaserFeedbackAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "phaser_feedback", phaserFeedbackSlider);
-
-    initKnob(phaserMixSlider, "");
-    phaserMixAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "phaser_mix", phaserMixSlider);
-
-    // Ladder Filter Controls
-    initToggle(filterEnableButton, "Filter Enable");
-    filterEnableAttach = std::make_unique<ButtonAttachment>(audioProcessor.apvts, "filter_enable", filterEnableButton);
-
-    initCombo(filterModeCombo, juce::StringArray("Lowpass", "Highpass"));
-    filterModeAttach = std::make_unique<ComboBoxAttachment>(audioProcessor.apvts, "filter_mode", filterModeCombo);
-
-    initKnob(filterResonanceSlider, "");
-    filterResonanceAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "filter_resonance", filterResonanceSlider);
-
-    fxGroup.setText("FX ENGINES");
-    addAndMakeVisible(fxGroup);
-
-    // Arpeggiator Controls & Layout
-    initToggle(arpEnableButton, "Enable Arpeggiator");
-    arpEnableAttach = std::make_unique<ButtonAttachment>(audioProcessor.apvts, "arp_enable", arpEnableButton);
-
-    initCombo(arpRateCombo, juce::StringArray("1/8", "1/16", "1/32"));
-    arpRateAttach = std::make_unique<ComboBoxAttachment>(audioProcessor.apvts, "arp_rate", arpRateCombo);
-
-    initCombo(arpPatternCombo, juce::StringArray("Up", "Down", "Up-Down", "Octaves"));
-    arpPatternAttach = std::make_unique<ComboBoxAttachment>(audioProcessor.apvts, "arp_pattern", arpPatternCombo);
-
-    arpGroup.setText("ARPEGGIATOR");
-    addAndMakeVisible(arpGroup);
-
-    keyboardComponent.setLookAndFeel(&customLookAndFeel);
-    addAndMakeVisible(keyboardComponent);
-
-    setSize(1150, 725);
-
-    // Start UI updates (60 FPS / 16ms refresh for smooth playhead)
-    startTimerHz(60);
+    setResizable(true, true);
+    setResizeLimits(kBaseWidth * 3 / 4, kBaseHeight * 3 / 4, kBaseWidth * 2, kBaseHeight * 2);
+    getConstrainer()->setFixedAspectRatio((double) kBaseWidth / kBaseHeight);
+    setSize(kBaseWidth, kBaseHeight);
+    startTimerHz(30);
 }
 
-RDSBAudioProcessorEditor::~RDSBAudioProcessorEditor()
-{
-    // Clean up look and feel pointers
-    durationSlider.setLookAndFeel(nullptr);
-    triggerButton.setLookAndFeel(nullptr);
-
-    tonalVolSlider.setLookAndFeel(nullptr);
-    tonalPitchStartSlider.setLookAndFeel(nullptr);
-    tonalPitchEndSlider.setLookAndFeel(nullptr);
-    tonalUnisonSlider.setLookAndFeel(nullptr);
-    tonalDetuneSlider.setLookAndFeel(nullptr);
-    tonalPanSpreadSlider.setLookAndFeel(nullptr);
-    pumperDepthSlider.setLookAndFeel(nullptr);
-    pumperRateStartSlider.setLookAndFeel(nullptr);
-    pumperRateEndSlider.setLookAndFeel(nullptr);
-
-    noiseVolSlider.setLookAndFeel(nullptr);
-    noiseTypeCombo.setLookAndFeel(nullptr);
-    noiseFilterModeCombo.setLookAndFeel(nullptr);
-    noiseCutoffStartSlider.setLookAndFeel(nullptr);
-    noiseCutoffEndSlider.setLookAndFeel(nullptr);
-    noiseFilterQSlider.setLookAndFeel(nullptr);
-
-    boomVolSlider.setLookAndFeel(nullptr);
-    boomTriggerCombo.setLookAndFeel(nullptr);
-    boomNoiseDecaySlider.setLookAndFeel(nullptr);
-    boomSubDecaySlider.setLookAndFeel(nullptr);
-    boomSubPitchStartSlider.setLookAndFeel(nullptr);
-    boomSubPitchEndSlider.setLookAndFeel(nullptr);
-
-    saturationDriveSlider.setLookAndFeel(nullptr);
-    reverbMixSlider.setLookAndFeel(nullptr);
-    reverbSizeSlider.setLookAndFeel(nullptr);
-    reverbWidthSlider.setLookAndFeel(nullptr);
-    warpKSlider.setLookAndFeel(nullptr);
-    masterVolSlider.setLookAndFeel(nullptr);
-    keyboardComponent.setLookAndFeel(nullptr);
-
-    phaserFeedbackSlider.setLookAndFeel(nullptr);
-    phaserMixSlider.setLookAndFeel(nullptr);
-    filterResonanceSlider.setLookAndFeel(nullptr);
-    phaserEnableButton.setLookAndFeel(nullptr);
-    filterEnableButton.setLookAndFeel(nullptr);
-    filterModeCombo.setLookAndFeel(nullptr);
-
-    arpEnableButton.setLookAndFeel(nullptr);
-    arpRateCombo.setLookAndFeel(nullptr);
-    arpPatternCombo.setLookAndFeel(nullptr);
-
-    modeCombo.setLookAndFeel(nullptr);
-    syncCombo.setLookAndFeel(nullptr);
+RDSBAudioProcessorEditor::~RDSBAudioProcessorEditor() {
+    stopTimer();
+    setLookAndFeel(nullptr);
 }
 
-void RDSBAudioProcessorEditor::paint(juce::Graphics& g)
-{
-    // Sleek premium dark slate background
-    g.fillAll(juce::Colour(0xFF101216));
-
-    // Dynamic color theme dependent on Mode
-    auto modeVal = audioProcessor.apvts.getRawParameterValue("mode")->load();
-    juce::Colour accentColour = (modeVal == 1.0f) 
-        ? juce::Colour(0xFFFF007A)  // Neon Magenta for Downlifters
-        : juce::Colour(0xFF00D2FF); // Neon Cyan for Risers
-
-    customLookAndFeel.setColour(juce::Slider::rotarySliderFillColourId, accentColour);
-    customLookAndFeel.setColour(juce::TextButton::buttonOnColourId, accentColour);
-    customLookAndFeel.setColour(juce::MidiKeyboardComponent::keyDownOverlayColourId, accentColour.withAlpha(0.5f));
-
-    // Title text
-    g.setColour(juce::Colours::white);
-    g.setFont(juce::Font("Outfit", 20.0f, juce::Font::bold));
-    g.drawText("RISE.DROP.SWEEP.BOOM", 20, 15, 300, 30, juce::Justification::left);
-
-    // Header labels
-    g.setColour(juce::Colours::grey);
-    g.setFont(juce::Font("Inter", 11.0f, juce::Font::plain));
-    g.drawText("BARS:", 945, 23, 40, 15, juce::Justification::right);
-
-    // Draw the real-time Warp Visualizer
-    juce::Rectangle<int> visArea(20, 80, 1110, 180);
-    drawVisualizer(g, visArea);
-
-    // Label coordinates inside Groups
-    g.setFont(10.0f);
-    g.setColour(juce::Colours::lightgrey);
-
-    // 1. Tonal Sweeper Labels
-    int tx = tonalGroup.getX();
-    int ty = tonalGroup.getY();
-    g.drawText("VOLUME", tx + 15, ty + 85, 60, 12, juce::Justification::centred);
-    g.drawText("START P", tx + 75, ty + 85, 55, 12, juce::Justification::centred);
-    g.drawText("END P", tx + 145, ty + 85, 55, 12, juce::Justification::centred);
-    
-    g.drawText("VOICES", tx + 15, ty + 160, 55, 12, juce::Justification::centred);
-    g.drawText("DETUNE", tx + 75, ty + 160, 55, 12, juce::Justification::centred);
-    g.drawText("WIDTH", tx + 135, ty + 160, 55, 12, juce::Justification::centred);
-
-    g.drawText("PUMP D", tx + 15, ty + 240, 55, 12, juce::Justification::centred);
-    g.drawText("RATE S", tx + 75, ty + 240, 55, 12, juce::Justification::centred);
-    g.drawText("RATE E", tx + 135, ty + 240, 55, 12, juce::Justification::centred);
-
-    // 2. Noise Engine Labels
-    int nx = noiseGroup.getX();
-    int ny = noiseGroup.getY();
-    g.drawText("VOLUME", nx + 15, ny + 85, 60, 12, juce::Justification::centred);
-    g.drawText("TYPE", nx + 85, ny + 15, 110, 12, juce::Justification::left);
-    g.drawText("FILTER", nx + 85, ny + 50, 110, 12, juce::Justification::left);
-
-    g.drawText("CUTOFF S", nx + 15, ty + 200, 55, 12, juce::Justification::centred);
-    g.drawText("CUTOFF E", nx + 75, ty + 200, 55, 12, juce::Justification::centred);
-    g.drawText("FILTER Q", nx + 135, ty + 200, 55, 12, juce::Justification::centred);
-
-    // 3. Boom Engine Labels
-    int bx = boomGroup.getX();
-    int by = boomGroup.getY();
-    g.drawText("VOLUME", bx + 15, by + 85, 60, 12, juce::Justification::centred);
-    g.drawText("TRIGGER", bx + 85, by + 15, 110, 12, juce::Justification::left);
-
-    g.drawText("PUNCH DEC", bx + 15, ty + 175, 55, 12, juce::Justification::centred);
-    g.drawText("RUMBLE DEC", bx + 75, ty + 175, 55, 12, juce::Justification::centred);
-    g.drawText("SUB START", bx + 15, ty + 255, 55, 12, juce::Justification::centred);
-    g.drawText("SUB END", bx + 75, ty + 255, 55, 12, juce::Justification::centred);
-
-    // 4. Master / FX Labels
-    int mx = masterGroup.getX();
-    int my = masterGroup.getY();
-    g.drawText("DRIVE", mx + 15, my + 90, 55, 12, juce::Justification::centred);
-    g.drawText("REV MIX", mx + 75, my + 90, 55, 12, juce::Justification::centred);
-    g.drawText("REV SIZE", mx + 135, my + 90, 55, 12, juce::Justification::centred);
-    g.drawText("REV WIDTH", mx + 75, my + 165, 55, 12, juce::Justification::centred);
-
-    g.drawText("WARP (k)", mx + 15, my + 270, 80, 12, juce::Justification::centred);
-    g.drawText("MASTER", mx + 115, my + 270, 80, 12, juce::Justification::centred);
-
-    // 5. FX Engines Labels
-    int fx = fxGroup.getX();
-    int fy = fxGroup.getY();
-    g.drawText("MIX", fx + 40, fy + 120, 55, 12, juce::Justification::centred);
-    g.drawText("FEEDBACK", fx + 115, fy + 120, 55, 12, juce::Justification::centred);
-    g.drawText("RESONANCE", fx + 77, fy + 267, 55, 12, juce::Justification::centred);
-
-    // 6. Arpeggiator Labels
-    int ax = arpGroup.getX();
-    int ay = arpGroup.getY();
-    g.setFont(11.0f);
-    g.setColour(juce::Colours::lightgrey);
-    g.drawText("RATE:", ax + 380, ay + 25, 60, 22, juce::Justification::right | juce::Justification::verticallyCentred);
-    g.drawText("PATTERN:", ax + 720, ay + 25, 80, 22, juce::Justification::right | juce::Justification::verticallyCentred);
+float RDSBAudioProcessorEditor::param(const char* id) const {
+    return audioProcessor.apvts.getRawParameterValue(id)->load();
 }
 
-void RDSBAudioProcessorEditor::resized()
-{
-    // Header Bounds
-    modeCombo.setBounds(280, 18, 120, 24);
-    syncCombo.setBounds(415, 18, 130, 24);
-    durationSlider.setBounds(990, 18, 140, 24);
-    triggerButton.setBounds(560, 18, 90, 24);
+void RDSBAudioProcessorEditor::addKnob(Knob& k, const juce::String& id, const juce::String& title,
+                                       const juce::String& tip, juce::Colour accent) {
+    k.slider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+    k.slider.setRotaryParameters(juce::MathConstants<float>::pi * 1.2f, juce::MathConstants<float>::pi * 2.8f, true);
+    k.slider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 64, 16);
+    k.slider.setColour(juce::Slider::rotarySliderFillColourId, accent);
+    k.slider.setTooltip(tip);
+    k.attachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(audioProcessor.apvts, id, k.slider);
+    addAndMakeVisible(k.slider);
 
-    // Bottom Groups
-    tonalGroup.setBounds(20, 280, 210, 300);
-    noiseGroup.setBounds(243, 280, 210, 300);
-    boomGroup.setBounds(466, 280, 210, 300);
-    masterGroup.setBounds(689, 280, 210, 300);
-    fxGroup.setBounds(912, 280, 210, 300);
-
-    // 1. Tonal Sweeper Layout
-    int tx = tonalGroup.getX();
-    int ty = tonalGroup.getY();
-    tonalVolSlider.setBounds(tx + 15, ty + 25, 60, 60);
-    tonalPitchStartSlider.setBounds(tx + 75, ty + 25, 55, 60);
-    tonalPitchEndSlider.setBounds(tx + 145, ty + 25, 55, 60);
-
-    tonalUnisonSlider.setBounds(tx + 15, ty + 100, 55, 60);
-    tonalDetuneSlider.setBounds(tx + 75, ty + 100, 55, 60);
-    tonalPanSpreadSlider.setBounds(tx + 135, ty + 100, 55, 60);
-
-    pumperDepthSlider.setBounds(tx + 15, ty + 180, 55, 60);
-    pumperRateStartSlider.setBounds(tx + 75, ty + 180, 55, 60);
-    pumperRateEndSlider.setBounds(tx + 135, ty + 180, 55, 60);
-
-    // 2. Noise Engine Layout
-    int nx = noiseGroup.getX();
-    int ny = noiseGroup.getY();
-    noiseVolSlider.setBounds(nx + 15, ny + 25, 60, 60);
-    noiseTypeCombo.setBounds(nx + 85, ny + 27, 110, 22);
-    noiseFilterModeCombo.setBounds(nx + 85, ny + 62, 110, 22);
-
-    noiseCutoffStartSlider.setBounds(nx + 15, ny + 140, 55, 60);
-    noiseCutoffEndSlider.setBounds(nx + 75, ny + 140, 55, 60);
-    noiseFilterQSlider.setBounds(nx + 135, ny + 140, 55, 60);
-
-    // 3. Boom Engine Layout
-    int bx = boomGroup.getX();
-    int by = boomGroup.getY();
-    boomVolSlider.setBounds(bx + 15, by + 25, 60, 60);
-    boomTriggerCombo.setBounds(bx + 85, by + 27, 110, 22);
-
-    boomNoiseDecaySlider.setBounds(bx + 15, by + 115, 55, 60);
-    boomSubDecaySlider.setBounds(bx + 75, by + 115, 55, 60);
-    boomSubPitchStartSlider.setBounds(bx + 15, by + 195, 55, 60);
-    boomSubPitchEndSlider.setBounds(bx + 75, by + 195, 55, 60);
-
-    // 4. Master & FX Layout
-    int mx = masterGroup.getX();
-    int my = masterGroup.getY();
-    saturationDriveSlider.setBounds(mx + 15, my + 30, 55, 60);
-    reverbMixSlider.setBounds(mx + 75, my + 30, 55, 60);
-    reverbSizeSlider.setBounds(mx + 135, my + 30, 55, 60);
-    reverbWidthSlider.setBounds(mx + 75, my + 105, 55, 60);
-
-    warpKSlider.setBounds(mx + 15, my + 185, 80, 85);
-    masterVolSlider.setBounds(mx + 115, my + 185, 80, 85);
-
-    // 5. FX Engines Layout
-    int fx = fxGroup.getX();
-    int fy = fxGroup.getY();
-    phaserEnableButton.setBounds(fx + 15, fy + 27, 180, 22);
-    phaserMixSlider.setBounds(fx + 40, fy + 60, 55, 60);
-    phaserFeedbackSlider.setBounds(fx + 115, fy + 60, 55, 60);
-
-    filterEnableButton.setBounds(fx + 15, fy + 137, 180, 22);
-    filterModeCombo.setBounds(fx + 15, fy + 172, 180, 22);
-    filterResonanceSlider.setBounds(fx + 77, fy + 207, 55, 60);
-
-    // 6. Arpeggiator Group Layout
-    arpGroup.setBounds(20, 590, 1110, 60);
-    int ax = arpGroup.getX();
-    int ay = arpGroup.getY();
-    arpEnableButton.setBounds(ax + 50, ay + 25, 180, 22);
-    arpRateCombo.setBounds(ax + 450, ay + 25, 150, 22);
-    arpPatternCombo.setBounds(ax + 810, ay + 25, 180, 22);
-
-    // On-Screen Keyboard layout
-    keyboardComponent.setBounds(20, 660, 1110, 50);
+    k.label.setText(title, juce::dontSendNotification);
+    k.label.setJustificationType(juce::Justification::centred);
+    k.label.setColour(juce::Label::textColourId, accent.interpolatedWith(juce::Colours::white, 0.35f));
+    k.label.setTooltip(tip);
+    addAndMakeVisible(k.label);
 }
 
-void RDSBAudioProcessorEditor::timerCallback()
-{
-    // Repaint to update the real-time visualizer playhead position
-    repaint();
+void RDSBAudioProcessorEditor::addChoice(Choice& c, const juce::String& id, const juce::StringArray& items,
+                                         const juce::String& tip, juce::Colour accent) {
+    c.box.addItemList(items, 1);
+    c.box.setTooltip(tip);
+    c.box.setColour(juce::ComboBox::outlineColourId, accent);
+    c.attachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(audioProcessor.apvts, id, c.box);
+    addAndMakeVisible(c.box);
 }
 
-void RDSBAudioProcessorEditor::drawVisualizer(juce::Graphics& g, juce::Rectangle<int> area)
-{
-    auto modeVal = audioProcessor.apvts.getRawParameterValue("mode")->load();
-    bool isDownlifter = (modeVal == 1.0f);
-    
-    juce::Colour accentColour = isDownlifter 
-        ? juce::Colour(0xFFFF007A)  // Neon Magenta
-        : juce::Colour(0xFF00D2FF); // Neon Blue
+void RDSBAudioProcessorEditor::addToggle(Toggle& t, const juce::String& id, const juce::String& title,
+                                         const juce::String& tip, juce::Colour accent) {
+    t.button.setButtonText(title);
+    t.button.setTooltip(tip);
+    t.button.setColour(juce::ToggleButton::tickColourId, accent);
+    t.attachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(audioProcessor.apvts, id, t.button);
+    addAndMakeVisible(t.button);
+}
 
-    // Draw visualizer background
-    g.setColour(juce::Colour(0xFF13171E));
-    g.fillRect(area);
+//==============================================================================
+void RDSBAudioProcessorEditor::refreshPresetList(const juce::String& selectName) {
+    presetBox.clear(juce::dontSendNotification);
+    int id = 1;
+    for (const auto& p : Presets::factory()) presetBox.addItem(p.name, id++);
 
-    // Draw subtle glowing frame border
-    g.setColour(accentColour.withAlpha(0.2f));
-    g.drawRect(area, 2.0f);
+    userPresetFiles = Presets::userPresetFiles();
+    if (userPresetFiles.size() > 0) {
+        presetBox.addSeparator();
+        presetBox.addSectionHeading("USER");
+        int uid = 1001;
+        for (const auto& f : userPresetFiles) {
+            presetBox.addItem(f.getFileNameWithoutExtension(), uid);
+            if (selectName.isNotEmpty() && f.getFileNameWithoutExtension() == juce::File::createLegalFileName(selectName))
+                presetBox.setSelectedId(uid, juce::dontSendNotification);
+            ++uid;
+        }
+    }
+}
 
-    // Draw grid
-    g.setColour(juce::Colour(0xFF2C323C).withAlpha(0.3f));
-    int gridCount = 8;
-    for (int i = 1; i < gridCount; ++i)
+void RDSBAudioProcessorEditor::stepPreset(int delta) {
+    const int count = presetBox.getNumItems();
+    if (count == 0) return;
+    int index = presetBox.getSelectedItemIndex();
+    for (int n = 0; n < count; ++n) {
+        index = (index + delta + count) % count;
+        if (presetBox.getItemId(index) != 0) {
+            presetBox.setSelectedItemIndex(index, juce::sendNotificationSync);
+            return;
+        }
+    }
+}
+
+void RDSBAudioProcessorEditor::promptSavePreset() {
+    auto* w = new juce::AlertWindow("Save preset", "Name this sound:", juce::MessageBoxIconType::NoIcon, this);
+    w->addTextEditor("name", "My Transition");
+    w->addButton("Save", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    w->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    w->enterModalState(true, juce::ModalCallbackFunction::create([this, w](int result) {
+        if (result == 1) {
+            const auto name = w->getTextEditorContents("name").trim();
+            if (name.isNotEmpty() && Presets::saveUser(audioProcessor, name)) refreshPresetList(name);
+        }
+    }), true);
+}
+
+void RDSBAudioProcessorEditor::timerCallback() { repaint(visualizerArea); }
+
+//==============================================================================
+void RDSBAudioProcessorEditor::paint(juce::Graphics& g) {
+    uiScale = (float) getWidth() / (float) kBaseWidth;
+    const float s = uiScale;
+
+    g.fillAll(LAF::background);
+
+    // Title: one colour per word, matching the engine it names.
     {
-        float ratio = static_cast<float>(i) / gridCount;
-        g.drawVerticalLine(area.getX() + ratio * area.getWidth(), area.getY(), area.getBottom());
-        g.drawHorizontalLine(area.getY() + ratio * area.getHeight(), area.getX(), area.getRight());
+        struct Word { const char* text; juce::Colour c; };
+        const Word words[] = { {"RISE", LAF::violet}, {".", LAF::dimText}, {"DROP", LAF::pink}, {".", LAF::dimText},
+                               {"SWEEP", LAF::cyan}, {".", LAF::dimText}, {"BOOM", LAF::orange} };
+        g.setFont(LAF::monoFont(22.0f * s, true));
+        float x = 20.0f * s;
+        const float y = 12.0f * s, h = 32.0f * s;
+        for (const auto& w : words) {
+            juce::GlyphArrangement ga;
+            ga.addLineOfText(g.getCurrentFont(), w.text, 0.0f, 0.0f);
+            const float tw = ga.getBoundingBox(0, -1, true).getWidth();
+            g.setColour(w.c.withAlpha(0.28f));
+            g.drawText(w.text, juce::Rectangle<float>(x + 1.5f, y + 1.5f, tw + 4.0f, h), juce::Justification::centredLeft, false);
+            g.setColour(w.c);
+            g.drawText(w.text, juce::Rectangle<float>(x, y, tw + 4.0f, h), juce::Justification::centredLeft, false);
+            x += tw;
+        }
     }
 
-    // Get parameters
-    float k = audioProcessor.apvts.getRawParameterValue("warp_k")->load();
-    float phase = audioProcessor.getMasterPhase();
+    // Section panels, tinted per engine.
+    const float ch = 9.0f * s;
+    for (const auto& sec : sections) {
+        const auto r = sec.bounds;
+        juce::Path p;
+        p.startNewSubPath(r.getX() + ch, r.getY());
+        p.lineTo(r.getRight(), r.getY());
+        p.lineTo(r.getRight(), r.getBottom() - ch);
+        p.lineTo(r.getRight() - ch, r.getBottom());
+        p.lineTo(r.getX(), r.getBottom());
+        p.lineTo(r.getX(), r.getY() + ch);
+        p.closeSubPath();
 
-    // Plot warp curve path
-    juce::Path p;
-    for (int x = 0; x <= area.getWidth(); ++x)
-    {
-        float normX = static_cast<float>(x) / area.getWidth();
-        // Calculate curve mapping
-        float activePhase = isDownlifter ? (1.0f - normX) : normX;
-        float warped = std::pow(activePhase, k);
-        float y = area.getBottom() - warped * area.getHeight();
+        g.setColour(LAF::panel);
+        g.fillPath(p);
+        g.setColour(sec.accent.withAlpha(0.10f));
+        g.strokePath(p, juce::PathStrokeType(4.0f * s));
+        g.setColour(sec.accent.withAlpha(0.75f));
+        g.strokePath(p, juce::PathStrokeType(1.0f));
 
-        if (x == 0)
-            p.startNewSubPath(area.getX() + x, y);
-        else
-            p.lineTo(area.getX() + x, y);
+        // Accent tab under the title.
+        g.setColour(sec.accent);
+        g.fillRect(juce::Rectangle<float>(r.getX() + 12.0f * s, r.getY() + 19.0f * s, 22.0f * s, 2.0f * s));
+        g.setFont(LAF::monoFont(10.5f * s, true));
+        g.drawText(sec.title, r.withHeight(18.0f * s).reduced(12.0f * s, 0), juce::Justification::centredLeft, false);
     }
 
-    // Glow effect - draw thick translucent curve underneath
-    g.setColour(accentColour.withAlpha(0.15f));
-    g.strokePath(p, juce::PathStrokeType(6.0f, juce::PathStrokeType::mitered, juce::PathStrokeType::rounded));
+    // Visualizer is drawn in base coordinates and scaled with the window.
+    {
+        juce::Graphics::ScopedSaveState ss(g);
+        g.addTransform(juce::AffineTransform::scale(uiScale));
+        drawVisualizer(g, juce::Rectangle<int>(12, kHeaderHeight + 4, kBaseWidth - 24, kVisualizerHeight));
+    }
+}
 
-    // Sharp curve line
-    g.setColour(accentColour);
-    g.strokePath(p, juce::PathStrokeType(2.5f, juce::PathStrokeType::mitered, juce::PathStrokeType::rounded));
+void RDSBAudioProcessorEditor::resized() {
+    uiScale = (float) getWidth() / (float) kBaseWidth;
+    const float s = uiScale;
+    auto area = getLocalBounds();
 
-    // Fill underneath the curve with gradient
-    juce::Path fillPath = p;
-    fillPath.lineTo(area.getRight(), area.getBottom());
-    fillPath.lineTo(area.getX(), area.getBottom());
-    fillPath.closeSubPath();
+    // ---- header
+    auto header = area.removeFromTop((int) (kHeaderHeight * s));
+    const int padY = (int) (18 * s);
+    savePresetButton.setBounds(header.removeFromRight((int) (72 * s)).reduced((int) (3 * s), padY));
+    nextPresetButton.setBounds(header.removeFromRight((int) (32 * s)).reduced((int) (2 * s), padY));
+    presetBox.setBounds(header.removeFromRight((int) (220 * s)).reduced((int) (2 * s), padY));
+    prevPresetButton.setBounds(header.removeFromRight((int) (32 * s)).reduced((int) (2 * s), padY));
 
-    juce::ColourGradient grad(accentColour.withAlpha(0.18f), area.getX(), area.getY(),
-                              accentColour.withAlpha(0.0f), area.getX(), area.getBottom(), false);
-    g.setGradientFill(grad);
-    g.fillPath(fillPath);
+    // title takes ~440px; controls follow
+    int x = (int) (470 * s);
+    modeCombo.box.setBounds(x, padY, (int) (120 * s), (int) (28 * s));
+    x += (int) (130 * s);
+    syncCombo.box.setBounds(x, padY, (int) (120 * s), (int) (28 * s));
+    x += (int) (130 * s);
+    triggerButton.setBounds(x, padY, (int) (86 * s), (int) (28 * s));
+    x += (int) (100 * s);
+    barsKnob.label.setBounds(x, (int) (6 * s), (int) (92 * s), (int) (14 * s));
+    barsKnob.slider.setBounds(x, (int) (18 * s), (int) (92 * s), (int) (46 * s));
+    barsKnob.slider.setTextBoxStyle(juce::Slider::TextBoxRight, false, (int) (62 * s), (int) (16 * s));
 
-    // Draw real-time playhead if transition is playing or if standing by
-    float playheadX = area.getX() + phase * area.getWidth();
-    
-    // Draw vertical playhead line
-    g.setColour(juce::Colours::white.withAlpha(0.2f));
-    g.drawVerticalLine(static_cast<int>(playheadX), area.getY(), area.getBottom());
+    visualizerArea = juce::Rectangle<int>((int) (12 * s), (int) ((kHeaderHeight + 4) * s),
+                                          (int) ((kBaseWidth - 24) * s), (int) (kVisualizerHeight * s));
+    area.removeFromTop((int) ((kVisualizerHeight + 10) * s));
 
-    // Draw glowing playhead dot on the curve
-    float activePlayheadPhase = isDownlifter ? (1.0f - phase) : phase;
-    float playheadWarped = std::pow(activePlayheadPhase, k);
-    float playheadY = area.getBottom() - playheadWarped * area.getHeight();
+    // ---- rows of sections
+    auto body = area.reduced((int) (12 * s), (int) (2 * s));
+    const int gap = (int) (8 * s);
+    const int rowHeights[2] = { (int) (kRow1Height * s), (int) (kRow2Height * s) };
 
-    // Glow circle
-    g.setColour(accentColour.withAlpha(0.4f));
-    g.fillEllipse(playheadX - 6.0f, playheadY - 6.0f, 12.0f, 12.0f);
+    for (size_t r = 0; r < rows.size(); ++r) {
+        auto rowArea = body.removeFromTop(rowHeights[r]);
+        body.removeFromTop(gap);
 
-    // Inner white point
-    g.setColour(juce::Colours::white);
-    g.fillEllipse(playheadX - 3.0f, playheadY - 3.0f, 6.0f, 6.0f);
+        // The keyboard shares the second row with its three sections.
+        juce::Rectangle<int> keyArea;
+        if (r == 1) keyArea = rowArea.removeFromRight((int) (kBaseWidth * 0.36f * s));
 
-    // Display Text parameters on the visualizer overlay
-    g.setColour(juce::Colours::grey.withAlpha(0.7f));
-    g.setFont(juce::Font("Inter", 10.0f, juce::Font::bold));
-    g.drawText("BPM: " + juce::String(audioProcessor.isPlaying() ? "SYNCED" : "MANUAL"), area.getX() + 10, area.getY() + 10, 100, 15, juce::Justification::left);
-    g.drawText("TRIGGER KEY: " + juce::MidiMessage::getMidiNoteName(audioProcessor.getTriggerMidiNote(), true, true, 3) + " (" + juce::String(audioProcessor.getTriggerMidiNote()) + ")", area.getX() + 120, area.getY() + 10, 200, 15, juce::Justification::left);
-    g.drawText("WARP COEFF: " + juce::String(k, 2), area.getX() + 10, area.getBottom() - 20, 150, 15, juce::Justification::left);
-    g.drawText("PHASE: " + juce::String(phase * 100.0f, 1) + "%", area.getRight() - 110, area.getBottom() - 20, 100, 15, juce::Justification::right);
+        float totalWeight = 0.0f;
+        for (auto idx : rows[r]) totalWeight += sections[idx].weight;
+        const float unit = (float) (rowArea.getWidth() - gap * ((int) rows[r].size() - (r == 1 ? 0 : 1))) / totalWeight;
+
+        float sx = (float) rowArea.getX();
+        for (auto idx : rows[r]) {
+            auto& sec = sections[idx];
+            const float w = unit * sec.weight;
+            sec.bounds = {sx, (float) rowArea.getY(), w, (float) rowArea.getHeight()};
+
+            auto inner = sec.bounds.toNearestInt().reduced((int) (7 * s), 0);
+            inner.removeFromTop((int) (24 * s));
+            inner.removeFromBottom((int) (5 * s));
+
+            for (auto* t : sec.toggles) t->button.setBounds(inner.removeFromTop((int) (24 * s)));
+            for (auto* c : sec.choices) {
+                c->box.setBounds(inner.removeFromTop((int) (24 * s)).reduced(0, (int) (1 * s)));
+                inner.removeFromTop((int) (2 * s));
+            }
+
+            if (!sec.knobs.empty()) {
+                const int perRow = sec.perRow;
+                const int numRows = ((int) sec.knobs.size() + perRow - 1) / perRow;
+                const int cellW = inner.getWidth() / perRow;
+                const int cellH = inner.getHeight() / numRows;
+                for (size_t i = 0; i < sec.knobs.size(); ++i) {
+                    auto* k = sec.knobs[i];
+                    const int col = (int) i % perRow, row = (int) i / perRow;
+                    juce::Rectangle<int> cell(inner.getX() + col * cellW, inner.getY() + row * cellH, cellW, cellH);
+                    k->label.setBounds(cell.removeFromTop((int) (14 * s)));
+                    k->label.setFont(LAF::monoFont(10.0f * s, true));
+                    k->slider.setBounds(cell);
+                    k->slider.setTextBoxStyle(juce::Slider::TextBoxBelow, false,
+                                              juce::jmin(cellW - 2, (int) (68 * s)), (int) (16 * s));
+                }
+            }
+            sx += w + (float) gap;
+        }
+        if (r == 1) keyboard.setBounds(keyArea.reduced((int) (4 * s), (int) (8 * s)));
+    }
+    keyboard.setKeyWidth((float) keyboard.getWidth() / 43.0f);
+}
+
+//==============================================================================
+void RDSBAudioProcessorEditor::drawVisualizer(juce::Graphics& g, juce::Rectangle<int> area) {
+    const auto f = area.toFloat();
+    g.setColour(juce::Colour(0xff08080d));
+    g.fillRect(f);
+    g.setColour(juce::Colours::white.withAlpha(0.08f));
+    g.drawRect(f, 1.0f);
+
+    const bool downlifter = param("mode") > 0.5f;
+    const float bars = param("duration_bars");
+    const float k = param("warp_k");
+
+    // Timeline: riser = sweep then boom; downlifter = boom then sweep.
+    const float boomFrac = 0.17f;
+    const float pad = 8.0f;
+    const float left = f.getX() + pad, width = f.getWidth() - pad * 2.0f;
+    const float top = f.getY() + 24.0f, bottom = f.getBottom() - 14.0f, hgt = bottom - top;
+    const float sweepW = width * (1.0f - boomFrac), boomW = width * boomFrac;
+    const float sweepX = downlifter ? left + boomW : left;
+    const float boomX = downlifter ? left : left + sweepW;
+
+    // grid
+    g.setColour(juce::Colours::white.withAlpha(0.045f));
+    for (int i = 1; i < 8; ++i) g.drawVerticalLine((int) (sweepX + sweepW * i / 8.0f), top, bottom);
+    for (int i = 1; i < 4; ++i) g.drawHorizontalLine((int) (top + hgt * i / 4.0f), left, left + width);
+
+    // Progress t (0..1, left to right in time) -> active sweep position.
+    auto active = [&](float t) { return downlifter ? 1.0f - t : t; };
+    auto yFor = [&](float norm) { return bottom - juce::jlimit(0.0f, 1.0f, norm) * hgt; };
+    auto strokeCurve = [&](const juce::Path& path, juce::Colour c, float w) {
+        g.setColour(c.withAlpha(0.18f));
+        g.strokePath(path, juce::PathStrokeType(w * 3.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        g.setColour(c);
+        g.strokePath(path, juce::PathStrokeType(w, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    };
+
+    constexpr int steps = 160;
+
+    // --- Tonal pitch (violet)
+    if (param("tonal_volume") > 0.001f) {
+        const int key = audioProcessor.getTriggerMidiNote() - 36;
+        const float ps = juce::jlimit(0.0f, 127.0f, param("tonal_pitch_start") + key);
+        const float pe = juce::jlimit(0.0f, 127.0f, param("tonal_pitch_end") + key);
+        juce::Path path, fill;
+        for (int i = 0; i <= steps; ++i) {
+            const float t = (float) i / steps;
+            const float midi = ps + (pe - ps) * std::pow(active(t), k);
+            const float x = sweepX + t * sweepW, y = yFor(midi / 127.0f);
+            if (i == 0) { path.startNewSubPath(x, y); fill.startNewSubPath(x, bottom); fill.lineTo(x, y); }
+            else { path.lineTo(x, y); fill.lineTo(x, y); }
+        }
+        fill.lineTo(sweepX + sweepW, bottom);
+        fill.closeSubPath();
+        g.setGradientFill(juce::ColourGradient(LAF::violet.withAlpha(0.20f), 0, top, LAF::violet.withAlpha(0.0f), 0, bottom, false));
+        g.fillPath(fill);
+        strokeCurve(path, LAF::violet, 2.0f);
+
+        g.setFont(LAF::monoFont(9.0f, true));
+        g.setColour(LAF::violet);
+        const float y0 = yFor((ps + (pe - ps) * std::pow(active(0.0f), k)) / 127.0f);
+        const float y1 = yFor((ps + (pe - ps) * std::pow(active(1.0f), k)) / 127.0f);
+        g.drawText(noteName(ps + (pe - ps) * std::pow(active(0.0f), k)), (int) sweepX + 4, (int) y0 - 14, 48, 12, juce::Justification::left, false);
+        g.drawText(noteName(ps + (pe - ps) * std::pow(active(1.0f), k)), (int) (sweepX + sweepW) - 52, (int) y1 - 14, 48, 12, juce::Justification::right, false);
+    }
+
+    // --- Noise cutoff (cyan), log frequency axis
+    if (param("noise_volume") > 0.001f) {
+        const float cs = param("noise_cutoff_start"), ce = param("noise_cutoff_end");
+        auto logNorm = [](float hzv) { return (std::log(juce::jlimit(20.0f, 20000.0f, hzv)) - std::log(20.0f)) / (std::log(20000.0f) - std::log(20.0f)); };
+        juce::Path path;
+        for (int i = 0; i <= steps; ++i) {
+            const float t = (float) i / steps;
+            const float c = cs + (ce - cs) * std::pow(active(t), k);
+            const float x = sweepX + t * sweepW, y = yFor(logNorm(c));
+            if (i == 0) path.startNewSubPath(x, y); else path.lineTo(x, y);
+        }
+        strokeCurve(path, LAF::cyan, 1.8f);
+    }
+
+    // --- Filter FX (lime)
+    if (param("filter_enable") > 0.5f) {
+        const bool hp = param("filter_mode") > 0.5f;
+        auto logNorm = [](float hzv) { return (std::log(juce::jlimit(20.0f, 20000.0f, hzv)) - std::log(20.0f)) / (std::log(20000.0f) - std::log(20.0f)); };
+        juce::Path path;
+        for (int i = 0; i <= steps; ++i) {
+            const float t = (float) i / steps;
+            const float w = std::pow(active(t), k);
+            const float c = hp ? 20000.0f - (20000.0f - 30.0f) * w : 100.0f + (20000.0f - 100.0f) * w;
+            const float x = sweepX + t * sweepW, y = yFor(logNorm(c));
+            if (i == 0) path.startNewSubPath(x, y); else path.lineTo(x, y);
+        }
+        g.setColour(LAF::lime.withAlpha(0.9f));
+        float dashes[] = { 5.0f, 4.0f };
+        juce::Path dashed;
+        juce::PathStrokeType(1.4f).createDashedStroke(dashed, path, dashes, 2);
+        g.fillPath(dashed);
+    }
+
+    // --- Pump pulses (pink ticks along the floor)
+    if (param("pumper_depth") > 0.01f && param("tonal_volume") > 0.001f) {
+        const float rs = param("pumper_rate_start"), re = param("pumper_rate_end");
+        const float totalBeats = bars * 4.0f;
+        float acc = 0.0f;
+        int lastWhole = 0;
+        g.setColour(LAF::pink);
+        for (int i = 1; i <= 800; ++i) {
+            const float t = (float) i / 800.0f;
+            const float rate = rs + (re - rs) * active(t);
+            acc += rate * totalBeats / 800.0f;
+            if ((int) acc > lastWhole) {
+                lastWhole = (int) acc;
+                const float x = sweepX + t * sweepW;
+                g.fillRect(x - 0.75f, bottom - 7.0f, 1.5f, 7.0f);
+            }
+        }
+    }
+
+    // --- Boom (orange): punch spike then the sub tail
+    if (param("boom_volume") > 0.001f) {
+        const float punch = param("boom_noise_decay"), rumble = param("boom_sub_decay");
+        const float total = juce::jmax(rumble, 0.1f);
+        juce::Path tail;
+        const float x0 = boomX;
+        tail.startNewSubPath(x0, bottom);
+        for (int i = 0; i <= 80; ++i) {
+            const float t = (float) i / 80.0f * total;
+            const float raw = std::exp(-t * (5.0f / rumble));
+            const float env = juce::jmax(0.0f, (raw - std::exp(-5.0f)) / (1.0f - std::exp(-5.0f)));
+            const float x = downlifter ? x0 + (float) i / 80.0f * boomW : x0 + (float) i / 80.0f * boomW;
+            tail.lineTo(x, yFor(0.15f + 0.8f * env * param("boom_volume")));
+        }
+        tail.lineTo(x0 + boomW, bottom);
+        tail.closeSubPath();
+        g.setGradientFill(juce::ColourGradient(LAF::orange.withAlpha(0.5f), 0, top, LAF::orange.withAlpha(0.05f), 0, bottom, false));
+        g.fillPath(tail);
+        g.setColour(LAF::orange);
+        g.strokePath(tail, juce::PathStrokeType(1.6f));
+
+        // punch spike: short bright burst at the front of the impact
+        const float spikeW = juce::jlimit(3.0f, boomW * 0.4f, boomW * (punch / total) * 3.0f);
+        g.setColour(juce::Colours::white.withAlpha(0.9f));
+        g.fillRect(x0, yFor(0.98f), spikeW * 0.35f, bottom - yFor(0.98f));
+        g.setColour(LAF::orange.withAlpha(0.35f));
+        g.fillRect(x0, yFor(0.98f), spikeW, bottom - yFor(0.98f));
+
+        g.setFont(LAF::monoFont(9.0f, true));
+        g.setColour(LAF::orange);
+        g.drawText("BOOM", (int) x0 + 4, (int) top - 2, 60, 12, juce::Justification::left, false);
+    }
+
+    // Drop line between sweep and boom.
+    {
+        const float dx = downlifter ? sweepX : sweepX + sweepW;
+        g.setColour(juce::Colours::white.withAlpha(0.35f));
+        float dashes[] = { 3.0f, 3.0f };
+        juce::Path line, dashed;
+        line.startNewSubPath(dx, top - 4.0f);
+        line.lineTo(dx, bottom);
+        juce::PathStrokeType(1.0f).createDashedStroke(dashed, line, dashes, 2);
+        g.fillPath(dashed);
+    }
+
+    // Playhead
+    if (audioProcessor.isPlaying()) {
+        const float t = juce::jlimit(0.0f, 1.0f, audioProcessor.getMasterPhase());
+        const float x = sweepX + t * sweepW;
+        g.setColour(juce::Colours::white.withAlpha(0.25f));
+        g.fillRect(x - 3.0f, top - 4.0f, 6.0f, bottom - top + 4.0f);
+        g.setColour(juce::Colours::white);
+        g.fillRect(x - 0.75f, top - 4.0f, 1.5f, bottom - top + 4.0f);
+    }
+
+    // Legend and readout
+    g.setFont(LAF::monoFont(9.5f, true));
+    float lx = f.getX() + 10.0f;
+    auto legend = [&](const char* text, juce::Colour c, bool on) {
+        g.setColour(c.withAlpha(on ? 1.0f : 0.25f));
+        g.fillEllipse(lx, f.getY() + 8.0f, 7.0f, 7.0f);
+        g.drawText(text, (int) lx + 11, (int) f.getY() + 4, 70, 14, juce::Justification::left, false);
+        lx += 82.0f;
+    };
+    legend("TONAL", LAF::violet, param("tonal_volume") > 0.001f);
+    legend("NOISE", LAF::cyan, param("noise_volume") > 0.001f);
+    legend("FILTER", LAF::lime, param("filter_enable") > 0.5f);
+    legend("PUMP", LAF::pink, param("pumper_depth") > 0.01f);
+    legend("BOOM", LAF::orange, param("boom_volume") > 0.001f);
+
+    g.setColour(LAF::dimText);
+    const juce::String info = juce::String(downlifter ? "DOWNLIFTER" : "RISER") + "  "
+                              + juce::String(bars, 1) + " BARS  KEY " + noteName(audioProcessor.getTriggerMidiNote());
+    g.drawText(info, f.toNearestInt().removeFromRight(300).withTrimmedRight(10).withHeight(20),
+               juce::Justification::centredRight, false);
 }

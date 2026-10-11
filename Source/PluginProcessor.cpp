@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "Presets.h"
 
 RDSBAudioProcessor::RDSBAudioProcessor()
     : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
@@ -38,21 +39,27 @@ double RDSBAudioProcessor::getTailLengthSeconds() const
 
 int RDSBAudioProcessor::getNumPrograms()
 {
-    return 1;
+    return static_cast<int>(Presets::factory().size());
 }
 
 int RDSBAudioProcessor::getCurrentProgram()
 {
-    return 0;
+    return currentProgram;
 }
 
-void RDSBAudioProcessor::setCurrentProgram(int)
+void RDSBAudioProcessor::setCurrentProgram(int index)
 {
+    if (index < 0 || index >= getNumPrograms())
+        return;
+    currentProgram = index;
+    Presets::applyFactory(*this, index);
 }
 
-const juce::String RDSBAudioProcessor::getProgramName(int)
+const juce::String RDSBAudioProcessor::getProgramName(int index)
 {
-    return "Default";
+    if (index < 0 || index >= getNumPrograms())
+        return {};
+    return Presets::factory()[static_cast<size_t>(index)].name;
 }
 
 void RDSBAudioProcessor::changeProgramName(int, const juce::String&)

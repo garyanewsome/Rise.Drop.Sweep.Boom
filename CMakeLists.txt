@@ -56,6 +56,8 @@ target_sources(RDSB PRIVATE
     Source/NoiseEngine.h
     Source/BoomEngine.h
     Source/FastRandom.h
+    Source/RDSBLookAndFeel.h
+    Source/Presets.h
 )
 
 # Compile definitions

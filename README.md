@@ -1,65 +1,53 @@
-# TransitionEngine VST
+# Rise.Drop.Sweep.Boom
 
-A lightweight, high-performance, host-synced transition synthesizer designed for creating dynamic risers, downlifters, sweeps, and explosive impacts (booms) directly within any modern DAW. Built with C++ using the JUCE framework.
+A host-synced transition synthesizer for risers, downlifters, sweeps and impacts. Built with C++ and the
+[JUCE](https://juce.com/) framework. Internal/target name: **RDSB**.
 
-## Project Architecture
+## What it does
 
-`TransitionEngine` focuses entirely on time-based modulation curves synced directly to the DAW host timeline. Rather than relying on traditional ADSR architectures, it utilizes a normalized $0.0 \to 1.0$ master phase ramp calculated relative to the target bar length and project tempo.
+Pick a length in bars, press play (or hit a key), and three engines sweep together then drop:
+
+| Engine | Colour | What you get |
+|---|---|---|
+| **Tonal sweep** | violet | Multi-saw riser with unison, detune, stereo spread, tempo-synced pumping and an arpeggiator |
+| **Noise** | cyan | White/pink noise through a sweeping band-pass or high-pass |
+| **Boom** | orange | Noise punch plus a pitch-dropping sub rumble, fired exactly at the drop |
+| **FX** | lime | Phaser and a 24 dB ladder filter that follow the sweep |
+| **Space / shape** | pink / white | Reverb, sweep curve, drive, master |
+
+* **Riser / Downlifter**, **Transport-synced** (locks to the DAW bar grid and loops) or **MIDI-triggered** (one-shot per key; the key transposes it).
+* The drop is sample-accurate and the output is limited so stacking engines cannot clip the host.
+* Hover any control for a plain-English definition; nine factory presets plus your own (`.rdsbpreset` in `~/Library/Application Support/RDSB/Presets`).
+* The visualizer layers each engine's contribution in its own colour, with pump pulses, the boom tail and a live playhead.
+
+## Architecture
 
 ```
-                             ┌───────────────┐
-                             │  DAW Timeline │
-                             └───────┬───────┘
-                                     │ (BPM, Position)
-                                     ▼
-                             ┌───────────────┐
-                             │ HostRampGen   │
-                             └───────┬───────┘
-                                     │
-                    ┌────────────────┼────────────────┐
-                    │ Normalized     │ Normalized     │ Normalized
-                    │ Ramp (0->1)    │ Ramp (0->1)    │ Trigger (1.0)
-                    ▼                ▼                ▼
-             ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-             │ TonalSweeper │ │ NoiseEngine  │ │  BoomEngine  │
-             │ (Multi-Saw)  │ │ (Band/High)  │ │ (Sub/Smack)  │
-             └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
-                    │                │                │
-                    └────────────────┼────────────────┘
-                                     │
-                                     ▼
-                             ┌───────────────┐
-                             │ Waveshaper    │
-                             │ (Saturator)   │
-                             └───────┬───────┘
-                                     │
-                                     ▼
-                             ┌───────────────┐
-                             │ Spatial Reverb│
-                             └───────┬───────┘
-                                     │
-                                     ▼
-                                [Audio Out]
+DAW timeline (tempo, PPQ, time signature)
+          |
+   block plan: sweep segments + sample-accurate boom triggers
+          |
+   TonalSweeper (multi-saw) + NoiseEngine (SVF) + BoomEngine (sub/punch)
+          |
+   Phaser -> Ladder filter -> Drive -> Master -> Reverb -> Safety limiter
 ```
 
----
+Code map: `PluginProcessor` (timing, planning, FX chain), `TonalSweeper`/`NoiseEngine`/`BoomEngine` (DSP),
+`FastRandom` (real-time-safe noise), `PluginEditor` + `RDSBLookAndFeel` (UI), `Presets` (factory + user presets).
 
-## Core Audio Engines
+## Build, test, install
 
-### 1. Tonal Sweeper (The Rise/Sweep)
-* **Oscillator Type:** Multi-sawtooth engine with adjustable stereo unison detune.
-* **Modulation:** Pitch tracks the master phase ramp using an exponential scaling curve to induce dramatic tension immediately before the drop boundary.
-* **Pumper Module:** Internal LFO modulating master amplitude, accelerating in rate (quarter notes $\to$ 8th $\to$ 16th $\to$ 32nd) linked directly to the progress of the master ramp.
+```bash
+cmake -B cmake-build -DCMAKE_BUILD_TYPE=Release
+cmake --build cmake-build                      # VST3, AU, Standalone (universal, macOS 14+)
+cmake --build cmake-build --target RDSBTests   # headless engine tests
+./cmake-build/RDSBTests_artefacts/Release/RDSBTests
+./cmake-build/RDSBTests_artefacts/Release/RDSBTests --snapshot ui.png   # render the editor offscreen
+installer/build_installer.sh                   # dist/Rise.Drop.Sweep.Boom-<ver>-macOS.dmg
+```
 
-### 2. Noise Engine (The Air/Whoosh)
-* **Generator:** Pure white and pink noise algorithms.
-* **Filter:** State Variable Filter (SVF) switchable between 12dB/octave Band-Pass and High-Pass configurations.
-* **Modulation:** Cutoff frequency sweeps automatically from $200\text{ Hz}$ up to $15\text{ kHz}$ along the active timeline.
-
-### 3. Boom Engine (The Impact)
-* **Transient Shockwave:** Zero-attack white noise burst passed through a fixed steep 24dB/octave Low-Pass Filter ($150\text{ Hz} - 300\text{ Hz}$) with a swift linear decay ($100\text{ ms}$).
-* **Sustained Rumble:** Monophonic sine wave oscillator governed by an aggressive exponential pitch envelope dropping from $\sim200\text{ Hz}$ down to a deep sub-bass register ($30\text{ Hz} - 45\text{ Hz}$) within $75\text{ ms}$, paired with a long, trailing amplitude decay ($2.0 - 4.0\text{ s}$).
-* **Triggering Logic:** Selectable between explicit MIDI mapping or auto-detonation immediately upon the master phase ramp reaching terminal capacity (`1.0`).
+The installer is unsigned by default (one-time "Open Anyway" on first run); Developer ID signing and
+notarization switch on via environment variables, see the script header.
 
 ---
 
@@ -93,16 +81,7 @@ $$f(x) = \tanh(\alpha \cdot x)$$
 ## Implementation Outline (JUCE Architecture)
 
 ### 1. Audio Processing Block (`PluginProcessor.cpp`)
-* Extract timing parameters via `juce::AudioPlayHead::CurrentPositionInfo`.
-* Implement the sample-accurate accumulator loop for tracking progress against host transport position.
-* Interleave parallel block calculations for the `TonalSweeper`, `NoiseEngine`, and `BoomEngine` components.
+* Timing comes from the host playhead (tempo, PPQ position, time signature).
+* Each block is planned up front: up to two sweep segments (before / after a loop boundary) plus sample-accurate boom triggers, so the drop lands on the exact sample whatever the buffer size.
+* `TonalSweeper`, `NoiseEngine` and `BoomEngine` render into the planned segments; FX sweeps update in 64-sample chunks.
 
-### 2. User Interface View (`PluginEditor.cpp`)
-* Custom 2D vector graphic window rendering the real-time geometric representation of the modulation warp curve.
-* Interactive sliders mapping to the curve coefficient $k$, unison detune width, and the global target bar length.
-* Macro controls toggling inversion routines to instantly transform an active Riser configuration into an automated Downlifter asset.
-
-## Compilation Requirements
-* **C++ Standard:** C++17 or higher
-* **Framework:** JUCE 7.x+ (Audio-Plugin Template)
-* **Target Architectures:** VST3, AU, Standalone Application
