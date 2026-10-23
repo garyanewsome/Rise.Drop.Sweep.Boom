@@ -39,7 +39,7 @@ Code map: `PluginProcessor` (timing, planning, FX chain), `TonalSweeper`/`NoiseE
 
 ```bash
 cmake -B cmake-build -DCMAKE_BUILD_TYPE=Release
-cmake --build cmake-build                      # VST3, AU, Standalone (universal, macOS 14+)
+cmake --build cmake-build                      # VST3, AU, Standalone (universal, macOS 13+)
 cmake --build cmake-build --target RDSBTests   # headless engine tests
 ./cmake-build/RDSBTests_artefacts/Release/RDSBTests
 ./cmake-build/RDSBTests_artefacts/Release/RDSBTests --snapshot ui.png   # render the editor offscreen
